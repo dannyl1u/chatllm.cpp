@@ -139,6 +139,7 @@ class ModelType(Enum):
     MiniCPM2    = 0x1101   # updated chat template, no tie_word_embeddings=False
     MiniCPM_MoE = 0x1102
     MiniCPM3    = 0x1110
+    MiniCPM4    = 0x1111
 
     Persimmon   = 0x1200
     Fuyu        = 0x1201
@@ -201,6 +202,8 @@ class ModelType(Enum):
     OrpheusTTS              = 0x10000106
     OuteTTSLlaMA            = 0x10000107
     OuteTTSQwen3            = 0x10000108
+    QWen3_Embedding         = 0x10000109
+    QWen3_ReRanker          = 0x1000010A
 
     LlaMAMulti    = 0x20000001
 
@@ -2071,6 +2074,68 @@ class MiniCPMConverter(BaseConverter):
     def get_weight_names(config):
         r = LlamaConverter.get_weight_names(config)
         if (config.tie_word_embeddings is None) or config.tie_word_embeddings:
+            r.remove('lm_head.weight')
+        return r
+
+class MiniCPM4Converter(BaseConverter):
+    MODEL_TYPE = ModelType.MiniCPM4
+
+    @classmethod
+    def pp(cls, config, name: str, tensor):
+        return MiniCPMConverter.pp(config, name, tensor)
+
+    @staticmethod
+    def dump_config(f, config, ggml_type):
+        MAX_FACTOR_LEN = 128
+
+        assert config.hidden_act == 'silu', "hidden_act must be silu"
+        if config.tie_word_embeddings is None:
+            config.tie_word_embeddings = True
+        if config.rope_scaling is not None:
+            assert config.rope_scaling['rope_type'] == 'longrope'
+            factor_len = len(config.rope_scaling['long_factor'])
+            assert factor_len <= MAX_FACTOR_LEN, "config.rope_scaling['long_factor']) must <= MAX_FACTOR_LEN"
+            factors = pad_to(config.rope_scaling['short_factor'], MAX_FACTOR_LEN) + pad_to(config.rope_scaling['long_factor'], MAX_FACTOR_LEN)
+
+            if config.max_position_embeddings == 32768:
+                print("`longrope` is configured, extend to 32k * 4.")
+                config.max_position_embeddings = 32768 * 4
+        else:
+            factor_len = 0
+            factors = pad_to([0.0], MAX_FACTOR_LEN * 2)
+
+        config_values = [
+            ggml_type.value,
+            config.vocab_size,
+            config.hidden_size,
+            config.num_attention_heads,
+            config.num_hidden_layers,
+            config.intermediate_size,
+            config.max_position_embeddings,
+            config.bos_token_id,
+            config.eos_token_id[0],
+            config.pad_token_id if config.pad_token_id is not None else -1,
+            config.sep_token_id if config.sep_token_id is not None else -1,
+            config.num_key_value_heads,
+            config.max_position_embeddings,
+            config.rope_scaling['original_max_position_embeddings'],
+            1 if config.tie_word_embeddings else 0,
+            factor_len,
+        ]
+        f.write(struct.pack("i" * len(config_values), *config_values))
+
+        float_values = [
+            config.mup_denominator if config.mup_denominator is not None else 0.0,
+            config.dim_model_base / config.hidden_size,
+            config.rope_theta if config.mup_denominator is not None else 10000.0,
+            config.scale_depth / math.sqrt(config.num_hidden_layers),
+        ] + factors
+        f.write(struct.pack("<" + "f" * len(float_values), *float_values))
+
+    @staticmethod
+    def get_weight_names(config):
+        r = LlamaConverter.get_weight_names(config)
+        if config.tie_word_embeddings:
             r.remove('lm_head.weight')
         return r
 
@@ -4489,6 +4554,7 @@ class QWen3Converter(BaseConverter):
     MODEL_TYPE = ModelType.QWen3
 
     layer_is_sparse = []
+    has_lm_head = True
 
     @staticmethod
     def dump_config(f, config, ggml_type):
@@ -4591,12 +4657,32 @@ class QWen3Converter(BaseConverter):
             "model.norm.weight"
         ]
 
-        if not config.tie_word_embeddings:
+        if QWen3Converter.has_lm_head and (not config.tie_word_embeddings):
             weight_names += [
                 "lm_head.weight"
             ]
 
         return weight_names
+
+class QWen3EmbConverter(BaseConverter):
+    MODEL_TYPE = ModelType.QWen3_Embedding
+
+    @classmethod
+    def state_dict_pp(cls, config, state_dict):
+        r = {}
+        for name in state_dict:
+            r['model.' + name] = state_dict[name]
+
+        return r
+
+    @staticmethod
+    def dump_config(f, config, ggml_type):
+        QWen3Converter.dump_config(f, config, ggml_type)
+
+    @staticmethod
+    def get_weight_names(config):
+        QWen3Converter.has_lm_head = False
+        return QWen3Converter.get_weight_names(config)
 
 def permute2(weights: torch.Tensor, n_head: int, partial_rotary_factor: float) -> torch.Tensor:
     hidden_size = weights.shape[0]
@@ -7038,9 +7124,12 @@ def main():
         OrionConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'MiniCPMForCausalLM':
         if config.num_experts is None:
-            if (config.tie_word_embeddings is not None) and (not config.tie_word_embeddings):
-                MiniCPMConverter.MODEL_TYPE = ModelType.MiniCPM2
-            MiniCPMConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
+            if (config.rope_scaling is not None) and ('rope_type' in config.rope_scaling) and (config.rope_scaling['rope_type'] == 'longrope'):
+                MiniCPM4Converter.convert(config, model_files, vocab, ggml_type, args.save_path)
+            else:
+                if (config.tie_word_embeddings is not None) and (not config.tie_word_embeddings):
+                    MiniCPMConverter.MODEL_TYPE = ModelType.MiniCPM2
+                MiniCPMConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
         else:
             MiniCPMMoEConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'MiniCPM3ForCausalLM':
@@ -7125,6 +7214,11 @@ def main():
         QWen3Converter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'deepseek-r1-distill-qwen3':
         QWen3Converter.MODEL_TYPE = ModelType.DeepSeek_R1_Distill_QWen3
+        QWen3Converter.convert(config, model_files, vocab, ggml_type, args.save_path)
+    elif arch == 'qwen3-embedding':
+        QWen3EmbConverter.convert(config, model_files, vocab, ggml_type, args.save_path)
+    elif arch == 'qwen3-reranker':
+        QWen3Converter.MODEL_TYPE = ModelType.QWen3_ReRanker
         QWen3Converter.convert(config, model_files, vocab, ggml_type, args.save_path)
     elif arch == 'reka-flash-3':
         assert config.rope_scaling is None, 'config.rope_scaling must be null'

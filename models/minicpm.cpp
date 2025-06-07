@@ -77,7 +77,7 @@ namespace v1
         {
             auto transformer = get_typed_transformer<ModelClass>();
 
-            loader.read_tensor("model.embed_tokens.weight", transformer->word_embeddings.weight);
+            transformer->word_embeddings->load("model.embed_tokens.", &loader);
             for (int i = 0; i < config.num_hidden_layers; i++)
             {
                 std::string layer_prefix = "model.layers." + std::to_string(layer_ids[i]) + '.';
@@ -92,7 +92,7 @@ namespace v1
                 loader.read_tensor(layer_prefix + "self_attn.q_proj.weight", transformer->layers[i].attention.q_proj.weight);
                 loader.read_tensor(layer_prefix + "self_attn.v_proj.weight", transformer->layers[i].attention.v_proj.weight);
             }
-            loader.read_tensor("model.norm.weight", transformer->final_layernorm.weight);
+            transformer->final_layernorm->load("model.norm.", &loader);
 
             if (transformer->lm_head)
                 loader.read_tensor("lm_head.weight", dynamic_cast<Linear *>(transformer->lm_head)->weight);
@@ -332,7 +332,7 @@ namespace moe
         {
             auto transformer = get_typed_transformer<ModelClass>();
 
-            loader.read_tensor("model.embed_tokens.weight", transformer->word_embeddings.weight);
+            transformer->word_embeddings->load("model.embed_tokens.", &loader);
             for (int i = 0; i < config.num_hidden_layers; i++)
             {
                 std::string layer_prefix = "model.layers." + std::to_string(layer_ids[i]) + '.';
@@ -351,7 +351,7 @@ namespace moe
                 loader.read_tensor(layer_prefix + "self_attn.q_proj.weight", transformer->layers[i].attention.q_proj.weight);
                 loader.read_tensor(layer_prefix + "self_attn.v_proj.weight", transformer->layers[i].attention.v_proj.weight);
             }
-            loader.read_tensor("model.norm.weight", transformer->final_layernorm.weight);
+            transformer->final_layernorm->load("model.norm.", &loader);
 
             CHATLLM_CHECK(w_ctx_.get_used_mem() == w_ctx_.get_mem_size())
                 << "corrupted model weights";
@@ -644,7 +644,7 @@ namespace emb_light
         {
             {
                 auto transformer = get_typed_transformer<ModelClass>();
-                transformer->final_layernorm.set_max_length(&w_ctx_, config.max_length);
+                (dynamic_cast<MiniCPMMeanPooling *>(transformer->final_layernorm))->set_max_length(&w_ctx_, config.max_length);
             }
         }
     };
@@ -746,6 +746,63 @@ namespace ranker_light
         ConditionalGeneration(const Config &config, const RuntimeConfig &runtime_config, ModelType type = ModelType::MODEL_TYPE_MiniCPM_ReRanker_Light)
             : emb_light::_ConditionalGeneration<MiniCPMClassificationHead, 2>(config, runtime_config, type)
         {
+        }
+    };
+}
+
+namespace v4
+{
+    const int MAX_FACTOR_LEN = 128;
+    struct Config : public BaseConfig
+    {
+        int num_key_value_heads;
+        int max_position_embeddings;
+        int original_max_position_embeddings;
+        int tie_word_embeddings;
+        int factor_len;
+
+        float mup_denominator;
+        float lm_head_pre_scale;
+        float rope_theta;
+        float scale_depth;
+        float short_factor[MAX_FACTOR_LEN];
+        float long_factor[MAX_FACTOR_LEN];
+    };
+
+    typedef v3::Tokenizer Tokenizer;
+
+    class ConditionalGeneration : public llama::v2::GenericConditionalGeneration<Phi3SUBlock>
+    {
+    public:
+        ConditionalGeneration() = default;
+        ConditionalGeneration(const Config &config, const RuntimeConfig &runtime_config, ModelType type = ModelType::MODEL_TYPE_MINICPM4)
+            : ConditionalGeneration(config, runtime_config, type, config.num_key_value_heads, config.max_length)
+        {}
+
+        ConditionalGeneration(const Config &config, const RuntimeConfig &runtime_config, ModelType type,
+                            int num_key_value_heads, int max_length)
+            : llama::v2::GenericConditionalGeneration<Phi3SUBlock>(config, runtime_config, type, num_key_value_heads, max_length, 13, config.tie_word_embeddings != 0)
+        {
+            float scaling_factor = (float)config.max_length / config.original_max_position_embeddings;
+            if (scaling_factor <= 1.0f)
+                scaling_factor = 1.0f;
+            else
+                scaling_factor = sqrtf(1.0f + logf(scaling_factor) / logf((float)config.original_max_position_embeddings));
+
+            for (int i = 0; i < config.num_hidden_layers; i++)
+            {
+                auto &attention = get_typed_transformer<ModelClass>()->layers[i].attention;
+                if (config.factor_len > 0)
+                {
+                    attention.config(&w_ctx_, config.original_max_position_embeddings, config.rope_theta,
+                                    scaling_factor,
+                                    scaling_factor,
+                                    config.factor_len,
+                                    config.short_factor,
+                                    config.long_factor);
+                }
+                get_typed_transformer<ModelClass>()->layers[i].scale_depth = config.scale_depth;
+            }
         }
     };
 }
