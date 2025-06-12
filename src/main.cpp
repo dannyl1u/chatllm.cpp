@@ -66,7 +66,9 @@ struct Args
     float top_p = 0.7f;
     float temp = 0.7f;
     float tfs_z = 0.95f;
-    float presence_penalty = 1.0f;
+    float presence_penalty = 0.0f;
+    float repeat_penalty = 1.0f;
+    float frequency_penalty = 0.0f;
     int num_threads = 0;
     bool multi_line = false;
     int seed;
@@ -90,6 +92,7 @@ struct Args
     bool moe_on_cpu = false;
     int batch_size = 4096;
     bool detect_thoughts = false;
+    int penalty_window = 256;
 };
 
 #define MULTI_LINE_END_MARKER_W  L"\\."
@@ -153,6 +156,7 @@ bool is_same_command_option(const std::string &a, const std::string &b)
 
 void usage(const std::string &prog)
 {
+    Args args;
     std::cout << "Usage: " << prog << " [options]\n"
               << "\n"
               << "Basic options:\n"
@@ -176,7 +180,7 @@ void usage(const std::string &prog)
               << "                            --layer_spec 0:3,1:4 (3 + 3 = 6 layers are selected, layer #1/2 are used twice)\n"
               << "                                                 layer structure: 0->1->2->1->2->3\n"
               << "  -c, --max_context_length N\n"
-              << "                          max context length (default: 512)\n"
+              << "                          max context length (default: " << args.max_context_length << ")\n"
               << "  --extending EXT         context extending method (EXT = restart | shift | none)\n"
               << "                          (default: none if `--load_session` is specified, otherwise restart)\n"
               << "  --multi                 enabled multiple lines of input                                                         [*]\n"
@@ -197,18 +201,21 @@ void usage(const std::string &prog)
               << "  --rpc_endpoints EP..    RPC endpoints (i.e. servers) for distributed inference (default: empty)\n"
               << "                          EP1;EP2, where EP ::= host:port\n"
               << "  --cache_dtype T         cache data type, T ::= f32 | f16 (default: f16)\n"
-              << "  --batch_size N          batch size (default: 4096)\n"
+              << "  --batch_size N          batch size (default: " << args.batch_size << ")\n"
               << "                          note: trade-off between prompt throughput and memory usage.\n"
               << "  --re_quantize Q         re-quantize model weights during loading (Q ::= q8_0 | q4_0 | q4_1 | q4_k | ...) (default: no re-quantization)\n"
               << "                          note: it does not make sense to re-quantize to a larger size.\n"
               << "Sampling options:\n"
               << "  --sampling ALG          sampling algorithm (ALG = greedy | top_p | tfs) (default: top_p) \n"
               << "                          where, tfs = Tail Free Sampling\n"
-              << "  -t, --temp T            temperature (default: 0.7) (Note: `-t 0` also sets sampling algorithm to greedy)\n"
-              << "  --top_k N               top-k sampling (default: 20)\n"
-              << "  --top_p N               top-p sampling (default: 0.7)\n"
-              << "  --tfs_z Z               Z param for TFS (default: 0.95)\n"
-              << "  --presence_penalty N    presence repetition penalty (default: 1.0, no penalty)\n"
+              << "  -t, --temp T            temperature (default: " << args.temp << ") (Note: `-t 0` also sets sampling algorithm to greedy)\n"
+              << "  --top_k N               top-k sampling (default: " << args.top_k << ")\n"
+              << "  --top_p N               top-p sampling (default: " << args.top_p << ")\n"
+              << "  --tfs_z Z               Z param for TFS (default: " << args.tfs_z << ")\n"
+              << "  --repeat_penalty N      repetition penalty (default: " << args.repeat_penalty << ", 1.0=no penalty)\n"
+              << "  --presence_penalty N    penalty alpha for presence (default: " << args.presence_penalty << ", 0.0=disabled)\n"
+              << "  --frequency_penalty N   penalty alpha for probability (default: " << args.frequency_penalty << ", 0.0=disabled)\n"
+              << "  --penalty_window N      last N tokens to consider for penalize (default: " << args.penalty_window << ", 0=disable all)\n"
               << "  --seed N                seed for random generator (default: random)\n"
               << "  --beam_size N           beam size for generation (default: -1, disabled)\n"
               << "                          functionality of beam search limited.\n"
@@ -465,6 +472,9 @@ static size_t parse_args(Args &args, const std::vector<std::string> &argv)
             handle_para0("--tfs_z",                       tfs_z,                std::stof)
             handle_param("--temp",                  "-t", temp,                 std::stof)
             handle_para0("--presence_penalty",            presence_penalty,     std::stof)
+            handle_para0("--repeat_penalty",              repeat_penalty,       std::stof)
+            handle_para0("--frequency_penalty",           frequency_penalty,    std::stof)
+            handle_para0("--penalty_window",              penalty_window,       std::stoi)
             handle_param("--threads",               "-n", num_threads,          std::stoi)
             handle_para0("--seed",                        seed,                 std::stoi)
             handle_para0("--test",                        test_fn,              std::string)
@@ -756,7 +766,7 @@ static void play_audio(const std::vector<int16_t> &data, const int sample_rate, 
     file.close();
 
     char cmd[2048];
-    sprintf(cmd, "ffplay -autoexit -f s16le -ch_layout %s -sample_rate %d \"%s\"", channels == 1 ? "mono" : "stereo", sample_rate, fn.c_str());
+    sprintf(cmd, "ffplay -loglevel error -autoexit -f s16le -ch_layout %s -sample_rate %d \"%s\"", channels == 1 ? "mono" : "stereo", sample_rate, fn.c_str());
     int r = system(cmd);
     if (export_fn.size() < 1)
         std::remove(fn.c_str());
@@ -801,17 +811,18 @@ static void run_tts(Args &args, chatllm::Pipeline &pipeline, TextStreamer &strea
 static void run_text_embedding(Args &args, chatllm::Pipeline &pipeline, TextStreamer &streamer, const chatllm::GenerationConfig &gen_config)
 {
     std::vector<float> result;
+    chatllm::BaseTokenizer::EmbeddingPurpose purpose = chatllm::BaseTokenizer::EmbeddingPurpose::Document;
 
     if (!args.interactive)
     {
-        pipeline.text_embedding(args.prompt, gen_config, result);
+        pipeline.text_embedding(args.prompt, gen_config, result, purpose);
         print_embedding(result, streamer.cout);
         return;
     }
 
     while (1)
     {
-        streamer.cout << "Input > " << std::flush;
+        streamer.cout << "Input " << (purpose == chatllm::BaseTokenizer::EmbeddingPurpose::Document ? "Doc" : "Query") <<  " > " << std::flush;
         std::string input;
         if (!get_utf8_line(input, args.multi_line))
         {
@@ -821,11 +832,13 @@ static void run_text_embedding(Args &args, chatllm::Pipeline &pipeline, TextStre
         if (input.empty()) continue;
 
         result.clear();
-        pipeline.text_embedding(input, gen_config, result);
+        pipeline.text_embedding(input, gen_config, result, purpose);
         streamer.cout << "      > ";
 
         print_embedding(result, streamer.cout);
 
+        purpose = purpose == chatllm::BaseTokenizer::EmbeddingPurpose::Document ?
+                    chatllm::BaseTokenizer::EmbeddingPurpose::Query : chatllm::BaseTokenizer::EmbeddingPurpose::Document;
     }
     streamer.cout << "Bye\n";
 }
@@ -852,7 +865,10 @@ static void run_qa_ranker(Args &args, chatllm::Pipeline &pipeline, TextStreamer 
 #define DEF_GenerationConfig(gen_config, args) chatllm::GenerationConfig gen_config(args.max_length, args.max_context_length, args.temp > 0, args.reversed_role, \
                                          args.top_k, args.top_p, args.temp, args.num_threads, args.sampling, args.presence_penalty, args.tfs_z); \
                                          gen_config.set_ai_prefix(args.ai_prefix); gen_config.dump_dot = args.dump_dot; \
-                                         gen_config.emb_rank_query_sep = args.emb_rank_query_sep;
+                                         gen_config.emb_rank_query_sep = args.emb_rank_query_sep; \
+                                         gen_config.repeat_penalty = args.repeat_penalty; \
+                                         gen_config.frequency_penalty = args.frequency_penalty; \
+                                         gen_config.penalty_window = args.penalty_window;
 
 #define DEF_ExtraArgs(pipe_args, args)  \
     chatllm::ModelObject::extra_args pipe_args(args.max_length, args.layer_spec, args.moe_on_cpu, args.num_threads, args.batch_size, args.cache_dtype, args.re_quantize);\
@@ -1387,6 +1403,7 @@ class Chat
 public:
     Chat():
         streamer(nullptr), pipeline(nullptr),
+        content_scratch(&history, ""),
         sess_n_past(-1), sess_hist_len(-1), is_rag(false),
         is_async_busy(false), async_result_int(0)
     {
@@ -1398,12 +1415,26 @@ public:
         params.push_back(utf8_str);
     }
 
+    std::string new_tmp_file(void)
+    {
+        tmp_files.push_back(utils::tmpname());
+        return tmp_files.back();
+    }
+
+    ~Chat()
+    {
+        for (auto &s : tmp_files)
+            std::filesystem::remove(s);
+    }
+
 public:
     std::vector<std::string> params;
     chatllm::Messages history;
     std::unique_ptr<chatllm::BaseStreamer> streamer;
     std::unique_ptr<chatllm::Pipeline> pipeline;
     chatllm::GenerationConfig gen_config;
+    chatllm::Content content_scratch;
+    std::vector<std::string> tmp_files;
     int sess_n_past;
     int sess_hist_len;
     Args args;
@@ -1514,6 +1545,35 @@ void chatllm_append_param(struct chatllm_obj *obj, const char *utf8_str)
     chat->append_param(utf8_str);
 }
 
+void chatllm_multimedia_msg_prepare(struct chatllm_obj *obj)
+{
+    DEF_CHAT();
+    chat->content_scratch.pieces.clear();
+}
+
+int chatllm_multimedia_msg_append(struct chatllm_obj *obj, const char *type, const char *utf8_str)
+{
+    DEF_CHAT();
+    if (strcmp(type, "text") == 0)
+    {
+        chat->content_scratch.push_back(std::string(utf8_str), chatllm::ContentPiece::Type::Text);
+        return 0;
+    }
+
+    auto t = chatllm::ContentPiece::type_parse(type);
+    if (chatllm::ContentPiece::Type::Text == t) return -1;
+
+    auto data = base64::decode(utf8_str);
+    auto fn   = chat->new_tmp_file();
+    auto f = std::fopen(fn.c_str(), "wb");
+    std::fwrite(data.data(), 1, data.size(), f);
+    std::fclose(f);
+
+    chat->content_scratch.push_back(fn, t);
+
+    return 0;
+}
+
 static void emit_model_info(Chat *chat, const Args &args, chatllm::Pipeline &pipeline)
 {
     auto o = json::JSON::Make(json::JSON::Class::Object);
@@ -1607,6 +1667,7 @@ int chatllm_start(struct chatllm_obj *obj, f_chatllm_print f_print, f_chatllm_en
     args.interactive = true;
     chat->streamer = std::unique_ptr<chatllm::BaseStreamer>(new FFIStreamer(nullptr, f_print, f_end, user_data));
     chat->streamer->log_level = init_args.log_level;
+    chat->history.set_mm_tags(args.multimedia_file_tags[0], args.multimedia_file_tags[1]);
 
     try
     {
@@ -1715,6 +1776,13 @@ static void chatllm_continue_chat(Chat *chat)
 
 int chatllm_user_input(struct chatllm_obj *obj, const char *utf8_str)
 {
+    chatllm_multimedia_msg_prepare(obj);
+    chatllm_multimedia_msg_append(obj, "text", utf8_str);
+    return chatllm_user_input_multimedia_msg(obj);
+}
+
+int chatllm_user_input_multimedia_msg(struct chatllm_obj *obj)
+{
     int r = 0;
     DEF_CHAT_STREAMER();
     auto role_user = chat->gen_config.reversed_role ? chatllm::MsgRole::Assistant : chatllm::MsgRole::User;
@@ -1725,7 +1793,7 @@ int chatllm_user_input(struct chatllm_obj *obj, const char *utf8_str)
     if (chat->pipeline->is_loaded() && (chat->pipeline->model->get_purpose() != chatllm::ModelPurpose::Chat))
         return -1;
 
-    chat->history.push_back(utf8_str, role_user);
+    chat->history.push_back(chat->content_scratch, role_user);
 
 generate:
     std::string output = chat->pipeline->chat(chat->history, chat->gen_config, streamer);
@@ -1753,6 +1821,11 @@ generate:
 int chatllm_async_user_input(struct chatllm_obj *obj, const char *utf8_str)
 {
     ASYNC_FUN_BODY(chatllm_user_input(obj, utf8_str));
+}
+
+int chatllm_async_user_input_multimedia_msg(struct chatllm_obj *obj)
+{
+    ASYNC_FUN_BODY(chatllm_user_input_multimedia_msg(obj));
 }
 
 int chatllm_ai_continue(struct chatllm_obj *obj, const char *utf8_str)
@@ -1811,7 +1884,7 @@ int chatllm_async_tool_completion(struct chatllm_obj *obj, const char *utf8_str)
     ASYNC_FUN_BODY(chatllm_tool_completion(obj, utf8_str));
 }
 
-int chatllm_text_embedding(struct chatllm_obj *obj, const char *utf8_str)
+int chatllm_text_embedding(struct chatllm_obj *obj, const char *utf8_str, int purpose)
 {
     int r = 0;
     DEF_CHAT_STREAMER();
@@ -1819,9 +1892,11 @@ int chatllm_text_embedding(struct chatllm_obj *obj, const char *utf8_str)
     if (!chat->pipeline->is_loaded() || (chat->pipeline->model->get_purpose() != chatllm::ModelPurpose::TextEmbedding))
         return -1;
 
+    chatllm::BaseTokenizer::EmbeddingPurpose purp = (chatllm::BaseTokenizer::EmbeddingPurpose)purpose;
+
     std::vector<float> result;
     std::string input(utf8_str);
-    chat->pipeline->text_embedding(input, chat->gen_config, result);
+    chat->pipeline->text_embedding(input, chat->gen_config, result, purp);
 
     std::ostringstream oss;
     for (size_t i = 0; i < result.size() - 1; i++)
@@ -1836,9 +1911,9 @@ int chatllm_text_embedding(struct chatllm_obj *obj, const char *utf8_str)
     return r;
 }
 
-int chatllm_async_text_embedding(struct chatllm_obj *obj, const char *utf8_str)
+int chatllm_async_text_embedding(struct chatllm_obj *obj, const char *utf8_str, int purpose)
 {
-    ASYNC_FUN_BODY(chatllm_text_embedding(obj, utf8_str));
+    ASYNC_FUN_BODY(chatllm_text_embedding(obj, utf8_str, purpose));
 }
 
 int chatllm_text_tokenize(struct chatllm_obj *obj, const char *utf8_str)

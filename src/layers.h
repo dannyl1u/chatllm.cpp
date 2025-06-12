@@ -125,7 +125,7 @@ namespace chatllm
         ggml::tensor *norm_inplace(ComputeContext *ctx, ggml::tensor *a, float eps);
         ggml::tensor *rms_norm_inplace(ComputeContext *ctx, ggml::tensor *a, float eps);
         ggml::tensor *rms_norm(ComputeContext *ctx, ggml::tensor *a, float eps);
-        ggml::tensor *simple_norm(ComputeContext *ctx, ggml::tensor *a, float eps);
+        ggml::tensor *simple_norm(ComputeContext *ctx, ggml::tensor *a, float eps); // p=2 normalization
 
         ggml::tensor *rope(ComputeContext *ctx, ggml::tensor *a, ggml::tensor *b, int n_dims, int mode);
         ggml::tensor *rope_ext(ComputeContext *ctx, ggml::tensor *a, ggml::tensor *b, ggml::tensor *c,
@@ -180,6 +180,14 @@ namespace chatllm
 
         ggml::tensor *custom(ComputeContext *ctx, ggml_custom_op_t fun, int n_tasks, void *userdata, std::vector<ggml::tensor *>inputs, ggml::type type, int64_t ne0, int64_t ne1 = 1, int64_t ne2 = 1, int64_t ne3 = 1);
 
+        struct merge_patch_param
+        {
+            int grid_h;
+            int grid_w;
+            int merge_kernel_size[2];
+        };
+        ggml::tensor *merge_patch(ComputeContext *ctx, ggml::tensor *x, const merge_patch_param *param);
+
         void mul_mat_set_prec(ggml::tensor *a, ggml::prec prec);
         bool is_contiguous(const ggml::tensor *a);
 
@@ -206,6 +214,7 @@ namespace chatllm
     {
     public:
         Block(): prec(ggml::prec::GGML_PREC_DEFAULT), id(0), debug(false) {}
+        virtual ~Block() {}
         virtual ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input)
         {
             CHATLLM_THROW << "forward(ComputeContext *ctx, ggml::tensor *input): not implemented";
@@ -581,7 +590,7 @@ namespace chatllm
         }
 
         using Block::forward;
-        ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input, int n_past) override;
+        ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input) override;
 
         int64_t get_param_num(bool effective_only) const override
         {
@@ -1274,10 +1283,10 @@ namespace chatllm
         void save_to_cache(ComputeContext *ctx, const int n_past, const int qlen, ggml::tensor *k, ggml::tensor *v) override;
 
         // output: [heads, qlen, head_size]
-        virtual ggml::tensor *get_k_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen);
+        ggml::tensor *get_k_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen) override;
 
         // output: [heads, head_size, klen]
-        virtual ggml::tensor *get_v_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen);
+        ggml::tensor *get_v_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen) override;
 
     public:
         const int k_hidden_size;

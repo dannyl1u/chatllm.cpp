@@ -947,6 +947,20 @@ namespace chatllm
         return tensor;
     }
 
+    ggml::tensor *ggml::merge_patch(ComputeContext *ctx, ggml::tensor *x, const merge_patch_param *param)
+    {
+        const int64_t kernel_height = param->merge_kernel_size[0];
+        const int64_t kernel_width  = param->merge_kernel_size[1];
+        const int64_t new_height    = param->grid_h / kernel_height;
+        const int64_t new_width     = param->grid_w / kernel_width;
+
+        std::vector<ggml::tensor *> inputs;
+        inputs.push_back(x);
+        auto reshaped_seq = ggml::custom(ctx, ggml_custom_merge_patch, GGML_N_TASKS_MAX, (void *)param, inputs, ggml::type_of(x),
+                            ggml::get_dim(x, 0), kernel_height * kernel_width * new_height * new_width * ggml::get_dim(x, 2), 1, 1);
+        return reshaped_seq;
+    }
+
     struct ggml_cgraph *ggml::new_graph_custom(ComputeContext *ctx, size_t size, bool grads)
     {
         return ggml_new_graph_custom(ctx->get_ctx(), size, grads);
@@ -1271,7 +1285,7 @@ namespace chatllm
         return ggml::nbytes(&t);
     }
 
-    ggml::tensor *RobertaEmbedding::forward(ComputeContext *ctx, ggml::tensor *input, int n_past)
+    ggml::tensor *RobertaEmbedding::forward(ComputeContext *ctx, ggml::tensor *input)
     {
         int qlen = (int)input->ne[0];
 
@@ -1801,11 +1815,11 @@ namespace chatllm
 
         ggml::build_forward_expand(ctx, ggml::cpy(ctx, Vcur, v_cache_view));
 
-        ggml::tensor * k_cache_view = ggml::view_1d(ctx, k_cache, qlen * k_hidden_size, ggml::row_size(k_cache) * n_past);
+        ggml::tensor * k_cache_view = ggml::view_1d(ctx, k_cache, (int64_t)qlen * k_hidden_size, ggml::row_size(k_cache) * n_past);
         ggml::tensor * k_view = nullptr;
         if (ggml::is_contiguous(k))
         {
-            k_view = ggml::view_1d(ctx, k, qlen * k_hidden_size, 0);
+            k_view = ggml::view_1d(ctx, k, (int64_t)qlen * k_hidden_size, 0);
         }
         else if (!ggml::is_quantized(k_cache))
         {
@@ -1817,7 +1831,7 @@ namespace chatllm
         else
         {
             k = ggml::cont(ctx, k);
-            k_view = ggml::view_1d(ctx, k, qlen * k_hidden_size, 0);
+            k_view = ggml::view_1d(ctx, k, (int64_t)qlen * k_hidden_size, 0);
         }
 
         // important: storing RoPE-ed version of K in the KV cache!

@@ -221,65 +221,6 @@ namespace vit
         Linear    linear_2;
     };
 
-    struct merge_patch_param
-    {
-        int grid_h;
-        int grid_w;
-        int merge_kernel_size[2];
-    };
-
-    static void ggml_custom_merge_patch(struct ggml_tensor * dst , const struct ggml_tensor * src, int ith, int nth, const merge_patch_param * param)
-    {
-        const int kernel_height = param->merge_kernel_size[0];
-        const int kernel_width  = param->merge_kernel_size[1];
-        const int new_height = param->grid_h / kernel_height;
-        const int new_width  = param->grid_w / kernel_width;
-
-        CHATLLM_CHECK(ggml::get_dim(src, 1) == (int64_t)param->grid_h * param->grid_w);
-
-        const int64_t nr  = ggml::nrows(dst);
-        const int64_t dr  = (nr + nth - 1)/nth;
-        const int64_t ir0 = dr*ith;
-        const int64_t ir1 = MIN(ir0 + dr, nr);
-
-        const int64_t nb1 = src->nb[1];
-        const int64_t nb2 = nb1 * kernel_width;
-        const int64_t nb3 = nb2 * kernel_height;
-        const int64_t nb4 = nb3 * new_width;
-
-        for (int64_t i4 = 0; i4 < new_height; i4++)
-        {
-            for (int64_t i3 = 0; i3 < new_width; i3++)
-            {
-                for (int64_t i2 = 0; i2 < kernel_height; i2++)
-                {
-                    for (int64_t i1 = 0; i1 < kernel_width; i1++)
-                    {
-                        const int64_t ir = (i2 + i4 * kernel_height) * param->grid_w + (i1 + i3 * kernel_width);
-                        if (ir < ir0) continue;
-                        if (ir > ir1) break;
-
-                        const void *src_data  = (void *)((char *)  src->data + ir*nb1);
-                              void *dst_data  = (void *)((char *)  dst->data + i4*nb4 + i3*nb3  + i2*nb2 + i1*nb1);
-                        memcpy(dst_data, src_data, nb1);
-                    }
-                }
-            }
-        }
-    }
-
-    static void ggml_custom_merge_patch(struct ggml_tensor * dst, int ith, int nth, void * userdata)
-    {
-        const merge_patch_param *param = (const merge_patch_param *)userdata;
-
-        const struct ggml_tensor * a = dst->src[0];
-        CHATLLM_CHECK(ggml::is_contiguous(a));
-        CHATLLM_CHECK(ggml::get_dim(a, 3) == 1);
-        CHATLLM_CHECK(ggml::get_dim(a, 2) == 1);
-
-        ggml_custom_merge_patch(dst, a, ith, nth, param);
-    }
-
     class VisionTransformer : public Block
     {
     public:
@@ -333,15 +274,7 @@ namespace vit
             merge_param.grid_h = grid_h;
             merge_param.grid_w = grid_w;
 
-            const int64_t kernel_height = merge_param.merge_kernel_size[0];
-            const int64_t kernel_width  = merge_param.merge_kernel_size[1];
-            const int64_t new_height    = grid_h / kernel_height;
-            const int64_t new_width     = grid_w / kernel_width;
-
-            std::vector<ggml::tensor *> params;
-            params.push_back(x);
-            auto reshaped_seq = ggml::custom(ctx, ggml_custom_merge_patch, GGML_N_TASKS_MAX, &merge_param, params, ggml::type_of(x),
-                                ggml::get_dim(x, 0), kernel_height * kernel_width * new_height * new_width * ggml::get_dim(x, 2), 1, 1);
+            auto reshaped_seq = ggml::merge_patch(ctx, x, &merge_param);
             return reshaped_seq;
         }
 
@@ -372,7 +305,7 @@ namespace vit
         MultiModalProjector multi_modal_projector;
     protected:
         bool loaded;
-        merge_patch_param merge_param;
+        ggml::merge_patch_param merge_param;
     };
 
     class VisualEmbeddingGeneration
@@ -403,8 +336,7 @@ namespace vit
         bool load_more(ggml::type dtype, int lm_hidden_size, const json::JSON &config)
         {
             const auto vis_cfg = config["config.json"]["vision_config"];
-            auto pp_cfg = config["preprocessor_config.json"];
-            if (!vis_cfg.IsObject() || !pp_cfg.IsObject()) return false;
+            if (!vis_cfg.IsObject()) return false;
 
             vis_config.dtype = dtype;
 
@@ -421,19 +353,34 @@ namespace vit
             vis_config.merge_kernel_size[0]   = (int)size[0].ToInt();
             vis_config.merge_kernel_size[1]   = (int)size[1].ToInt();
 
-            auto image_mean = pp_cfg["image_mean"];
-            auto image_std  = pp_cfg["image_std"];
-            CHATLLM_CHECK(image_mean.length() == 3) << "invalid image_mean";
-            CHATLLM_CHECK(image_std.length() == 3) << "invalid image_std";
+            vis_config.in_token_limit       = 4096;
+            vis_config.pad_input            = true;
+            for (int i = 0; i < 3; i++)
+            {
+                vis_config.image_mean[i]    = 0.5f;
+                vis_config.image_std[i]     = 0.5f;
+            }
 
-            vis_config.in_token_limit   = (int  )pp_cfg["in_token_limit"].ToInt();
-            vis_config.pad_input        =        pp_cfg["pad_input"].ToBool();
-            vis_config.image_mean[0]    = (float)image_mean[0].ToFloat();
-            vis_config.image_mean[1]    = (float)image_mean[1].ToFloat();
-            vis_config.image_mean[2]    = (float)image_mean[2].ToFloat();
-            vis_config.image_std[0]     = (float)image_std[0].ToFloat();
-            vis_config.image_std[1]     = (float)image_std[1].ToFloat();
-            vis_config.image_std[2]     = (float)image_std[2].ToFloat();
+            auto pp_cfg = config["preprocessor_config.json"];
+            if (pp_cfg.IsObject())
+            {
+                vis_config.in_token_limit   = (int  )pp_cfg["in_token_limit"].ToInt();
+                vis_config.pad_input        =        pp_cfg["pad_input"].ToBool();
+
+                auto image_mean = pp_cfg["image_mean"];
+                auto image_std  = pp_cfg["image_std"];
+                CHATLLM_CHECK(image_mean.length() == 3) << "invalid image_mean";
+                CHATLLM_CHECK(image_std.length() == 3) << "invalid image_std";
+
+                vis_config.in_token_limit   = (int  )pp_cfg["in_token_limit"].ToInt();
+                vis_config.pad_input        =        pp_cfg["pad_input"].ToBool();
+                vis_config.image_mean[0]    = (float)image_mean[0].ToFloat();
+                vis_config.image_mean[1]    = (float)image_mean[1].ToFloat();
+                vis_config.image_mean[2]    = (float)image_mean[2].ToFloat();
+                vis_config.image_std[0]     = (float)image_std[0].ToFloat();
+                vis_config.image_std[1]     = (float)image_std[1].ToFloat();
+                vis_config.image_std[2]     = (float)image_std[2].ToFloat();
+            }
 
             const size_t tensor_ovhd = ggml_tensor_overhead();
             const size_t num_tensors = 11 + vis_config.num_hidden_layers * 18;
@@ -466,8 +413,6 @@ namespace vit
             ForwardContext ctx(&backend_context);
             ctx.gctx = GGMLContext({.mem_size = backend_context.buf_compute_meta.size(), .mem_buffer = backend_context.buf_compute_meta.data(), .no_alloc = true});
             ctx.gf = ggml::new_graph_custom(&ctx, GRAPH_SIZE, false);
-
-            const int total_patches = tok->get_image_total_emb_vectors();
 
             ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Prolog);
             ggml::tensor *media_emb = ggml::new_tensor_4d(&ctx, ggml::type::GGML_TYPE_F32, vis_config.patch_size, vis_config.patch_size, 3, image.grid_width * image.grid_height);
@@ -723,12 +668,12 @@ namespace vl
         void before_generate(const GenerationConfig &gen_config) override
         {
             std::vector<uint8_t> buf;
-            auto &emb = dynamic_cast<ModelClass *>(transformer)->word_embeddings;
-            visual.generate(gen_config, dynamic_cast<Tokenizer *>(tokenizer), ggml::type_of(emb.weight), buf);
+            auto emb = dynamic_cast<Embedding *>(dynamic_cast<ModelClass *>(transformer)->word_embeddings);
+            visual.generate(gen_config, dynamic_cast<Tokenizer *>(tokenizer), ggml::type_of(emb->weight), buf);
             if (buf.size() < 1) return;
 
-            size_t offset = emb.get_base_nbytes();
-            Backend::write_tensor_data(emb.weight, buf.data(), offset, buf.size());
+            size_t offset = emb->get_base_nbytes();
+            Backend::write_tensor_data(emb->weight, buf.data(), offset, buf.size());
         }
     public:
         vit::VisualEmbeddingGeneration visual;
