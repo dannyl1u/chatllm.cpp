@@ -214,6 +214,14 @@ namespace chatllm
         }
     }
 
+    ggml::tensor *ggml::init_tensor(ggml::tensor  *tensor,
+        ggml::type type,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3)
+    {
+        int64_t ne[4] = {ne0, ne1, ne2, ne3};
+        return ggml::init_tensor(tensor, type, 4, ne);
+    }
+
     ggml::tensor *ggml::init_tensor(ggml::tensor *tensor,
         ggml::type    type,
         int           n_dims,
@@ -265,6 +273,11 @@ namespace chatllm
     size_t ggml::nbytes(const ggml::tensor * tensor)
     {
         return ggml_nbytes(tensor);
+    }
+
+    size_t ggml::tensor_overhead(void)
+    {
+        return ggml_tensor_overhead();
     }
 
     int ggml::n_dims(const ggml::tensor * tensor)
@@ -410,6 +423,15 @@ namespace chatllm
     ggml::tensor *ggml::avg_pool_2d(ComputeContext *ctx, ggml::tensor *a, int kernel_size, int stride, float padding)
     {
         ggml::tensor *tensor = ggml_pool_2d(ctx->get_ctx(), a, GGML_OP_POOL_AVG, kernel_size, kernel_size, stride, stride, padding, padding);
+        ctx->cb_op_tensor(tensor);
+        return tensor;
+    }
+
+    ggml::tensor *ggml::avg_pool_1d(ComputeContext *ctx, ggml::tensor *a, int kernel_size, int stride, int padding)
+    {
+        if (!ggml::is_contiguous(a))
+            a = ggml::cont(ctx, a);
+        ggml::tensor *tensor = ggml_pool_1d(ctx->get_ctx(), a, GGML_OP_POOL_AVG, kernel_size, stride, padding);
         ctx->cb_op_tensor(tensor);
         return tensor;
     }
@@ -568,8 +590,15 @@ namespace chatllm
             }
         case InterpolateMode::Bicubic:
             {
+                CHATLLM_CHECK(ggml::get_dim(a, 2) == ne2);
+                CHATLLM_CHECK(ggml::get_dim(a, 3) == ne3);
+
+                if ((ggml::get_dim(a, 0) == ne0) && (ggml::get_dim(a, 1) == ne1))
+                    return a;
+
                 std::vector<tensor *> tensors;
                 tensors.push_back(a);
+
                 ggml::tensor *tensor = custom(ctx, ggml_compute_forward_bicubic, GGML_N_TASKS_MAX, nullptr, tensors,
                         ggml::type_of(a), ne0, ne1, ne2, ne3);
                 return tensor;
@@ -584,6 +613,8 @@ namespace chatllm
 
     ggml::tensor *ggml::norm(ComputeContext *ctx, ggml::tensor *a, float eps)
     {
+        if (!ggml::is_contiguous(a))
+            a = ggml::cont(ctx, a);
         ggml::tensor *tensor = ggml_norm(ctx->get_ctx(), a, eps);
         ctx->cb_op_tensor(tensor);
         return tensor;
@@ -947,6 +978,20 @@ namespace chatllm
         return tensor;
     }
 
+    ggml::tensor *ggml::merge_patch(ComputeContext *ctx, ggml::tensor *x, const merge_patch_param *param)
+    {
+        const int64_t kernel_height = param->merge_kernel_size[0];
+        const int64_t kernel_width  = param->merge_kernel_size[1];
+        const int64_t new_height    = param->grid_h / kernel_height;
+        const int64_t new_width     = param->grid_w / kernel_width;
+
+        std::vector<ggml::tensor *> inputs;
+        inputs.push_back(x);
+        auto reshaped_seq = ggml::custom(ctx, ggml_custom_merge_patch, GGML_N_TASKS_MAX, (void *)param, inputs, ggml::type_of(x),
+                            ggml::get_dim(x, 0), kernel_height * kernel_width * new_height * new_width * ggml::get_dim(x, 2), 1, 1);
+        return reshaped_seq;
+    }
+
     struct ggml_cgraph *ggml::new_graph_custom(ComputeContext *ctx, size_t size, bool grads)
     {
         return ggml_new_graph_custom(ctx->get_ctx(), size, grads);
@@ -977,7 +1022,24 @@ namespace chatllm
         return ggml_nelements(tensor);
     }
 
-    int BlockParams::num_padding_embeddings = 0;
+    int  BlockParams::num_padding_embeddings = 0;
+    bool BlockParams::OverrideKProjBiased::active = false;
+    bool BlockParams::OverrideKProjBiased::biased = false;
+
+    BlockParams::OverrideKProjBiased::OverrideKProjBiased(bool biased)
+    {
+        OverrideKProjBiased::active = true;
+        OverrideKProjBiased::biased = biased;
+    }
+    BlockParams::OverrideKProjBiased::~OverrideKProjBiased()
+    {
+        OverrideKProjBiased::active = false;
+    }
+
+    bool BlockParams::OverrideKProjBiased::get(bool biased)
+    {
+        return OverrideKProjBiased::active ? OverrideKProjBiased::biased : biased;
+    }
 
     ggml::tensor *Sequential::forward(ComputeContext *ctx, ggml::tensor *input)
     {
@@ -1271,7 +1333,7 @@ namespace chatllm
         return ggml::nbytes(&t);
     }
 
-    ggml::tensor *RobertaEmbedding::forward(ComputeContext *ctx, ggml::tensor *input, int n_past)
+    ggml::tensor *RobertaEmbedding::forward(ComputeContext *ctx, ggml::tensor *input)
     {
         int qlen = (int)input->ne[0];
 
@@ -1801,11 +1863,11 @@ namespace chatllm
 
         ggml::build_forward_expand(ctx, ggml::cpy(ctx, Vcur, v_cache_view));
 
-        ggml::tensor * k_cache_view = ggml::view_1d(ctx, k_cache, qlen * k_hidden_size, ggml::row_size(k_cache) * n_past);
+        ggml::tensor * k_cache_view = ggml::view_1d(ctx, k_cache, (int64_t)qlen * k_hidden_size, ggml::row_size(k_cache) * n_past);
         ggml::tensor * k_view = nullptr;
         if (ggml::is_contiguous(k))
         {
-            k_view = ggml::view_1d(ctx, k, qlen * k_hidden_size, 0);
+            k_view = ggml::view_1d(ctx, k, (int64_t)qlen * k_hidden_size, 0);
         }
         else if (!ggml::is_quantized(k_cache))
         {
@@ -1817,7 +1879,7 @@ namespace chatllm
         else
         {
             k = ggml::cont(ctx, k);
-            k_view = ggml::view_1d(ctx, k, qlen * k_hidden_size, 0);
+            k_view = ggml::view_1d(ctx, k, (int64_t)qlen * k_hidden_size, 0);
         }
 
         // important: storing RoPE-ed version of K in the KV cache!

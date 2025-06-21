@@ -23,7 +23,7 @@ namespace vit
     public:
         Learnable2DInterpPosEmb() {}
         Learnable2DInterpPosEmb(InitContext *ctx, int height, int width, int dim)
-            : pos_emb(ggml::new_tensor_3d(ctx, ggml::type::GGML_TYPE_F32, dim, width, height))
+            : pos_emb(ggml::new_tensor_3d(ctx, ggml::type::GGML_TYPE_F32, dim, height, width))
         {
         }
 
@@ -36,7 +36,22 @@ namespace vit
         {
             CHATLLM_CHECK(ggml::get_dim(input, 3) == 1);
 
-            auto output = ggml::add(ctx, input, pos_emb);
+            //input: ggml[dim, h, w]
+
+            ggml::tensor * interp = nullptr;
+            if ((ggml::get_dim(input, 1) == ggml::get_dim(pos_emb, 1)) && (ggml::get_dim(input, 2) == ggml::get_dim(pos_emb, 2)))
+            {
+                interp = pos_emb;
+            }
+            else
+            {
+                auto permuted = ggml::permute(ctx, pos_emb, 2, 0, 1, 3);
+                interp = ggml::interpolate(ctx, permuted, ggml::InterpolateMode::Bicubic,
+                    ggml::get_dim(input, 1), ggml::get_dim(input, 2), ggml::get_dim(permuted, 2), ggml::get_dim(permuted, 3));
+                interp = ggml::permute(ctx, interp, 1, 2, 0, 3);
+            }
+
+            auto output = ggml::add(ctx, input, interp);
 
             return output;
         }
@@ -106,28 +121,26 @@ namespace vit
         void before_forward(ComputeContext *ctx, const int n_past, const int qlen) override
         {
             const int len = grid_h * grid_w;
+            std::vector<int> v_pos_h;
 
             CHATLLM_CHECK(len <= max_length);
 
             ggml::set_dim(pos,   0, len);
             ggml::set_dim(pos_h, 0, len);
 
+            v_pos_h.resize(len);
 
-            for (int i = 0; i < grid_h; i++)
+            for (int i = 0; i < grid_w; i++)
             {
-                for (int j = 0; j < grid_w; j++)
-                    v_pos[i * grid_w + j] = j;
+                for (int j = 0; j < grid_h; j++)
+                {
+                    v_pos  [i * grid_h + j] = j;
+                    v_pos_h[i * grid_h + j] = i;
+                }
             }
 
-            Backend::write_tensor_data(pos, v_pos.data(), 0, len * sizeof(v_pos[0]));
-
-            for (int i = 0; i < grid_h; i++)
-            {
-                for (int j = 0; j < grid_w; j++)
-                    v_pos[i * grid_w + j] = i;
-            }
-
-            Backend::write_tensor_data(pos_h, v_pos.data(), 0, len * sizeof(v_pos[0]));
+            Backend::write_tensor_data(pos,     v_pos.data(), 0, len * sizeof(v_pos[0]));
+            Backend::write_tensor_data(pos_h, v_pos_h.data(), 0, len * sizeof(v_pos[0]));
         }
 
         ggml::tensor *apply_2d_rope(ComputeContext *ctx, ggml::tensor *hidden, int hidden_size, ggml::tensor *pos_w, ggml::tensor *pos_h) const
@@ -185,11 +198,13 @@ namespace vit
             linear_1(ctx, hidden_size, hidden_size),
             linear_2(ctx, hidden_size, lm_hidden_size)
         {
+            memcpy(merge_param.merge_kernel_size, config.merge_kernel_size, sizeof(merge_param.merge_kernel_size));
         }
 
         ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *image_features) override
         {
-            auto output = pre_norm.forward(ctx, image_features);
+            auto output = merge_patch(ctx, image_features);
+            output = pre_norm.forward(ctx, output);
             output = ggml::reshape_2d(ctx, output,
                 hidden_size, ggml::get_dim(output, 1) / (hidden_size / ggml::get_dim(output, 0)) * ggml::get_dim(output, 2) * ggml::get_dim(output, 3));
             output = linear_1.forward(ctx, output);
@@ -214,71 +229,19 @@ namespace vit
             linear_2.load(path + "linear_2.", loader);
         }
 
+    protected:
+        ggml::tensor *merge_patch(ComputeContext *ctx, ggml::tensor *x)
+        {
+            auto reshaped_seq = ggml::merge_patch(ctx, x, &merge_param);
+            return reshaped_seq;
+        }
     public:
         const int hidden_size;
         LayerNorm pre_norm;
         Linear    linear_1;
         Linear    linear_2;
+        ggml::merge_patch_param merge_param;
     };
-
-    struct merge_patch_param
-    {
-        int grid_h;
-        int grid_w;
-        int merge_kernel_size[2];
-    };
-
-    static void ggml_custom_merge_patch(struct ggml_tensor * dst , const struct ggml_tensor * src, int ith, int nth, const merge_patch_param * param)
-    {
-        const int kernel_height = param->merge_kernel_size[0];
-        const int kernel_width  = param->merge_kernel_size[1];
-        const int new_height = param->grid_h / kernel_height;
-        const int new_width  = param->grid_w / kernel_width;
-
-        CHATLLM_CHECK(ggml::get_dim(src, 1) == (int64_t)param->grid_h * param->grid_w);
-
-        const int64_t nr  = ggml::nrows(dst);
-        const int64_t dr  = (nr + nth - 1)/nth;
-        const int64_t ir0 = dr*ith;
-        const int64_t ir1 = MIN(ir0 + dr, nr);
-
-        const int64_t nb1 = src->nb[1];
-        const int64_t nb2 = nb1 * kernel_width;
-        const int64_t nb3 = nb2 * kernel_height;
-        const int64_t nb4 = nb3 * new_width;
-
-        for (int64_t i4 = 0; i4 < new_height; i4++)
-        {
-            for (int64_t i3 = 0; i3 < new_width; i3++)
-            {
-                for (int64_t i2 = 0; i2 < kernel_height; i2++)
-                {
-                    for (int64_t i1 = 0; i1 < kernel_width; i1++)
-                    {
-                        const int64_t ir = (i2 + i4 * kernel_height) * param->grid_w + (i1 + i3 * kernel_width);
-                        if (ir < ir0) continue;
-                        if (ir > ir1) break;
-
-                        const void *src_data  = (void *)((char *)  src->data + ir*nb1);
-                              void *dst_data  = (void *)((char *)  dst->data + i4*nb4 + i3*nb3  + i2*nb2 + i1*nb1);
-                        memcpy(dst_data, src_data, nb1);
-                    }
-                }
-            }
-        }
-    }
-
-    static void ggml_custom_merge_patch(struct ggml_tensor * dst, int ith, int nth, void * userdata)
-    {
-        const merge_patch_param *param = (const merge_patch_param *)userdata;
-
-        const struct ggml_tensor * a = dst->src[0];
-        CHATLLM_CHECK(ggml::is_contiguous(a));
-        CHATLLM_CHECK(ggml::get_dim(a, 3) == 1);
-        CHATLLM_CHECK(ggml::get_dim(a, 2) == 1);
-
-        ggml_custom_merge_patch(dst, a, ith, nth, param);
-    }
 
     class VisionTransformer : public Block
     {
@@ -299,7 +262,6 @@ namespace vit
                 layer->set_id(layer_id);
                 layers.emplace_back(layer);
             }
-            memcpy(merge_param.merge_kernel_size, config.merge_kernel_size, sizeof(merge_param.merge_kernel_size));
         }
 
         int64_t get_param_num(bool effective_only) const override
@@ -328,25 +290,11 @@ namespace vit
             loaded = true;
         }
 
-        ggml::tensor *merge_patch(ComputeContext *ctx, ggml::tensor *x, int grid_h, int grid_w)
-        {
-            merge_param.grid_h = grid_h;
-            merge_param.grid_w = grid_w;
-
-            const int64_t kernel_height = merge_param.merge_kernel_size[0];
-            const int64_t kernel_width  = merge_param.merge_kernel_size[1];
-            const int64_t new_height    = grid_h / kernel_height;
-            const int64_t new_width     = grid_w / kernel_width;
-
-            std::vector<ggml::tensor *> params;
-            params.push_back(x);
-            auto reshaped_seq = ggml::custom(ctx, ggml_custom_merge_patch, GGML_N_TASKS_MAX, &merge_param, params, ggml::type_of(x),
-                                ggml::get_dim(x, 0), kernel_height * kernel_width * new_height * new_width * ggml::get_dim(x, 2), 1, 1);
-            return reshaped_seq;
-        }
-
         ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input, int grid_h, int grid_w)
         {
+            multi_modal_projector.merge_param.grid_h = grid_h;
+            multi_modal_projector.merge_param.grid_w = grid_w;
+
             auto output = embeddings.forward(ctx, input, grid_h, grid_w);
 
             for (size_t i = 0; i < layers.size(); i++)
@@ -356,7 +304,6 @@ namespace vit
                 output = layers[i]->forward(ctx, output, 0);
             }
             output = post_layernorm.forward(ctx, output);
-            output = merge_patch(ctx, output, grid_h, grid_w);
             output = multi_modal_projector.forward(ctx, output);
             return output;
         }
@@ -372,7 +319,6 @@ namespace vit
         MultiModalProjector multi_modal_projector;
     protected:
         bool loaded;
-        merge_patch_param merge_param;
     };
 
     class VisualEmbeddingGeneration
@@ -403,8 +349,7 @@ namespace vit
         bool load_more(ggml::type dtype, int lm_hidden_size, const json::JSON &config)
         {
             const auto vis_cfg = config["config.json"]["vision_config"];
-            auto pp_cfg = config["preprocessor_config.json"];
-            if (!vis_cfg.IsObject() || !pp_cfg.IsObject()) return false;
+            if (!vis_cfg.IsObject()) return false;
 
             vis_config.dtype = dtype;
 
@@ -421,19 +366,34 @@ namespace vit
             vis_config.merge_kernel_size[0]   = (int)size[0].ToInt();
             vis_config.merge_kernel_size[1]   = (int)size[1].ToInt();
 
-            auto image_mean = pp_cfg["image_mean"];
-            auto image_std  = pp_cfg["image_std"];
-            CHATLLM_CHECK(image_mean.length() == 3) << "invalid image_mean";
-            CHATLLM_CHECK(image_std.length() == 3) << "invalid image_std";
+            vis_config.in_token_limit       = 4096;
+            vis_config.pad_input            = true;
+            for (int i = 0; i < 3; i++)
+            {
+                vis_config.image_mean[i]    = 0.5f;
+                vis_config.image_std[i]     = 0.5f;
+            }
 
-            vis_config.in_token_limit   = (int  )pp_cfg["in_token_limit"].ToInt();
-            vis_config.pad_input        =        pp_cfg["pad_input"].ToBool();
-            vis_config.image_mean[0]    = (float)image_mean[0].ToFloat();
-            vis_config.image_mean[1]    = (float)image_mean[1].ToFloat();
-            vis_config.image_mean[2]    = (float)image_mean[2].ToFloat();
-            vis_config.image_std[0]     = (float)image_std[0].ToFloat();
-            vis_config.image_std[1]     = (float)image_std[1].ToFloat();
-            vis_config.image_std[2]     = (float)image_std[2].ToFloat();
+            auto pp_cfg = config["preprocessor_config.json"];
+            if (pp_cfg.IsObject())
+            {
+                vis_config.in_token_limit   = (int  )pp_cfg["in_token_limit"].ToInt();
+                vis_config.pad_input        =        pp_cfg["pad_input"].ToBool();
+
+                auto image_mean = pp_cfg["image_mean"];
+                auto image_std  = pp_cfg["image_std"];
+                CHATLLM_CHECK(image_mean.length() == 3) << "invalid image_mean";
+                CHATLLM_CHECK(image_std.length() == 3) << "invalid image_std";
+
+                vis_config.in_token_limit   = (int  )pp_cfg["in_token_limit"].ToInt();
+                vis_config.pad_input        =        pp_cfg["pad_input"].ToBool();
+                vis_config.image_mean[0]    = (float)image_mean[0].ToFloat();
+                vis_config.image_mean[1]    = (float)image_mean[1].ToFloat();
+                vis_config.image_mean[2]    = (float)image_mean[2].ToFloat();
+                vis_config.image_std[0]     = (float)image_std[0].ToFloat();
+                vis_config.image_std[1]     = (float)image_std[1].ToFloat();
+                vis_config.image_std[2]     = (float)image_std[2].ToFloat();
+            }
 
             const size_t tensor_ovhd = ggml_tensor_overhead();
             const size_t num_tensors = 11 + vis_config.num_hidden_layers * 18;
@@ -466,8 +426,6 @@ namespace vit
             ForwardContext ctx(&backend_context);
             ctx.gctx = GGMLContext({.mem_size = backend_context.buf_compute_meta.size(), .mem_buffer = backend_context.buf_compute_meta.data(), .no_alloc = true});
             ctx.gf = ggml::new_graph_custom(&ctx, GRAPH_SIZE, false);
-
-            const int total_patches = tok->get_image_total_emb_vectors();
 
             ctx.move_to_layer(LayerAllocatorManager::MiscLayer::Prolog);
             ggml::tensor *media_emb = ggml::new_tensor_4d(&ctx, ggml::type::GGML_TYPE_F32, vis_config.patch_size, vis_config.patch_size, 3, image.grid_width * image.grid_height);
@@ -628,6 +586,8 @@ namespace vl
         int media_content_token_id;
         int media_end_token_id;
         int media_pad_token_id;
+
+        int video_max_frames = 20;
     };
 
     void ChatHistoryEncoder::append_ai(int round_idx, const std::string &ai, std::vector<int> &ids) const
@@ -720,15 +680,21 @@ namespace vl
             _chat_encoder.vit_loaded = visual.load(loader);
         }
 
+        void set_additional_args(const std::map<std::string, std::string> &args) override
+        {
+            Tokenizer *tok = dynamic_cast<Tokenizer *>(tokenizer);
+            tok->video_max_frames = utils::get_opt(args, "video_max_frames", tok->video_max_frames);
+        }
+
         void before_generate(const GenerationConfig &gen_config) override
         {
             std::vector<uint8_t> buf;
-            auto &emb = dynamic_cast<ModelClass *>(transformer)->word_embeddings;
-            visual.generate(gen_config, dynamic_cast<Tokenizer *>(tokenizer), ggml::type_of(emb.weight), buf);
+            auto emb = dynamic_cast<Embedding *>(dynamic_cast<ModelClass *>(transformer)->word_embeddings);
+            visual.generate(gen_config, dynamic_cast<Tokenizer *>(tokenizer), ggml::type_of(emb->weight), buf);
             if (buf.size() < 1) return;
 
-            size_t offset = emb.get_base_nbytes();
-            Backend::write_tensor_data(emb.weight, buf.data(), offset, buf.size());
+            size_t offset = emb->get_base_nbytes();
+            Backend::write_tensor_data(emb->weight, buf.data(), offset, buf.size());
         }
     public:
         vit::VisualEmbeddingGeneration visual;
@@ -739,7 +705,33 @@ namespace vl
         Tokenizer *tok = dynamic_cast<Tokenizer *>(tokenizer);
         append_user_opening(round_idx, ids);
 
+        std::vector<std::unique_ptr<vision::VideoLoader>> videos;
+
+        // expand video into images
+        std::vector<ContentPiece> pieces;
         for (auto &piece : user.pieces)
+        {
+            if (piece.type != ContentPiece::Type::Video)
+            {
+                pieces.push_back(piece);
+                continue;
+            }
+
+            // video is just like a collection of images.
+            // But, it's still not clear on fps.
+            // https://github.com/MoonshotAI/Kimi-VL/issues/24#issuecomment-2804163270
+            auto video = new vision::VideoLoader(piece.content.c_str(), 1.0f, tok->video_max_frames);
+            videos.emplace_back(video);
+            if (video->frames.size() < 1)
+                continue;
+
+            for (size_t i = 0; i < video->frames.size(); i++)
+            {
+                pieces.emplace_back(video->frames[i], ContentPiece::Type::Image);
+            }
+        }
+
+        for (auto &piece : pieces)
         {
             if (piece.type == ContentPiece::Type::Text)
             {
@@ -757,9 +749,6 @@ namespace vl
                 vision::MaxPatchNum     param2(vis_config->in_token_limit);
                 vision::MaxGridHeight   param3(512);
                 vision::MaxGridWidth    param4(512);
-
-                // TODO: cubic interpolation not ready yet. image size fixed.
-                vision::Resize          resize(896, 896);
 
                 vision::image_load(piece.content.c_str(), pixels, w, h, patch_size, vision::PaddingMode::Black);
 

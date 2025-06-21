@@ -160,7 +160,7 @@ namespace pro
             before_forward(ctx, input_ids, n_past);
 
             ctx->move_to_layer(LayerAllocatorManager::Prolog);
-            ggml::tensor *hidden_states = word_embeddings.forward(ctx, input_ids);
+            ggml::tensor *hidden_states = word_embeddings->forward(ctx, input_ids);
             for (auto &layer : HeterogeneousModel::layers)
             {
                 int id = layer->get_id();
@@ -182,7 +182,7 @@ namespace pro
             }
 
             ctx->move_to_layer(LayerAllocatorManager::Epilog);
-            return final_steps(ctx, input_ids, hidden_states);
+            return final_steps->forward(this, ctx, input_ids, hidden_states);
         }
 
         void init_layer_fowarding(float alpha, int pair_num, const int *pairs)
@@ -238,7 +238,7 @@ namespace pro
         void load(ModelLoader &loader) override
         {
             auto transformer = get_typed_transformer<SolarModel>();
-            loader.read_tensor("model.embed_tokens.weight", transformer->word_embeddings.weight);
+            transformer->word_embeddings->load("model.embed_tokens.", &loader);
             for (int i = 0; i < config.num_hidden_layers; i++)
             {
                 std::string layer_prefix = "model.layers." + std::to_string(layer_ids[i]) + '.';
@@ -253,7 +253,7 @@ namespace pro
                 loader.read_tensor(layer_prefix + "self_attn.q_proj.weight", transformer->layers[i].attention.q_proj.weight);
                 loader.read_tensor(layer_prefix + "self_attn.v_proj.weight", transformer->layers[i].attention.v_proj.weight);
             }
-            loader.read_tensor("model.norm.weight", transformer->final_layernorm.weight);
+            transformer->final_layernorm->load("model.norm.", &loader);
 
             if (transformer->lm_head)
                 loader.read_tensor("lm_head.weight", dynamic_cast<Linear *>(transformer->lm_head)->weight);

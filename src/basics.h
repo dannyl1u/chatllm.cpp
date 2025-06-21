@@ -5,6 +5,7 @@
 #include <functional>
 #include <algorithm>
 #include <sstream>
+#include <map>
 
 #if defined(_WIN32)
 #define strcasecmp stricmp
@@ -70,4 +71,30 @@ namespace utils
 
     // for (i = start; i < end; i++) { func(i); }
     void parallel_for(int64_t start, int64_t end, std::function<void(int64_t)> func, int num_threads = 0);
+
+    std::string load_file(const char *fn);
+
+    std::string num2words(int value);
+
+    std::string sec2hms(float seconds, bool show_ms = false);
+    std::string sec2ms(float seconds, bool show_ms = false);
+
+    // create a unique temp file name (full path)
+    std::string tmpname(void);
+
+    bool is_same_command_option(const char *a, const char *b);
+    bool is_same_command_option(const std::string &a, const std::string &b);
+
+    int         get_opt(const std::map<std::string, std::string> &options, const char *key, int def);
+    double      get_opt(const std::map<std::string, std::string> &options, const char *key, double def);
+    bool        get_opt(const std::map<std::string, std::string> &options, const char *key, const bool def);
+    std::string get_opt(const std::map<std::string, std::string> &options, const char *key, const char *def);
+    std::string get_opt(const std::map<std::string, std::string> &options, const char *key, const std::string &def);
+
+    //#define TIME_STAMP (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count())
 }
+
+#if defined(_MSC_VER)
+#define popen  _popen
+#define pclose _pclose
+#endif

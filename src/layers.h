@@ -125,7 +125,7 @@ namespace chatllm
         ggml::tensor *norm_inplace(ComputeContext *ctx, ggml::tensor *a, float eps);
         ggml::tensor *rms_norm_inplace(ComputeContext *ctx, ggml::tensor *a, float eps);
         ggml::tensor *rms_norm(ComputeContext *ctx, ggml::tensor *a, float eps);
-        ggml::tensor *simple_norm(ComputeContext *ctx, ggml::tensor *a, float eps);
+        ggml::tensor *simple_norm(ComputeContext *ctx, ggml::tensor *a, float eps); // p=2 normalization
 
         ggml::tensor *rope(ComputeContext *ctx, ggml::tensor *a, ggml::tensor *b, int n_dims, int mode);
         ggml::tensor *rope_ext(ComputeContext *ctx, ggml::tensor *a, ggml::tensor *b, ggml::tensor *c,
@@ -158,6 +158,7 @@ namespace chatllm
         ggml::tensor *abs(ComputeContext *ctx, ggml::tensor *a);
         ggml::tensor *clamp(ComputeContext *ctx, ggml::tensor *a, float min, float max);
         ggml::tensor *avg_pool_2d(ComputeContext *ctx, ggml::tensor *a, int kernel_size, int stride, float padding = 0.0f);
+        ggml::tensor *avg_pool_1d(ComputeContext *ctx, ggml::tensor *a, int kernel_size, int stride,   int padding = 0);
 
         ggml::tensor *conv_1d(ComputeContext *ctx, ggml::tensor *kernel, ggml::tensor *data, int stride, int padding = 0, int dilation = 1);
         ggml::tensor *conv_1d_depthwise(ComputeContext *ctx, ggml::tensor *kernel, ggml::tensor *data, int stride, int padding, int dilation);
@@ -180,6 +181,14 @@ namespace chatllm
 
         ggml::tensor *custom(ComputeContext *ctx, ggml_custom_op_t fun, int n_tasks, void *userdata, std::vector<ggml::tensor *>inputs, ggml::type type, int64_t ne0, int64_t ne1 = 1, int64_t ne2 = 1, int64_t ne3 = 1);
 
+        struct merge_patch_param
+        {
+            int grid_h;
+            int grid_w;
+            int merge_kernel_size[2];
+        };
+        ggml::tensor *merge_patch(ComputeContext *ctx, ggml::tensor *x, const merge_patch_param *param);
+
         void mul_mat_set_prec(ggml::tensor *a, ggml::prec prec);
         bool is_contiguous(const ggml::tensor *a);
 
@@ -200,12 +209,24 @@ namespace chatllm
             ~PadEmbedding(void) { BlockParams::num_padding_embeddings = 0; }
             int get(void) const { return BlockParams::num_padding_embeddings; }
         };
+
+        class OverrideKProjBiased
+        {
+        public:
+            OverrideKProjBiased(bool biased);
+            ~OverrideKProjBiased();
+            static bool get(bool biased);
+        protected:
+            static bool active;
+            static bool biased;
+        };
     };
 
     class Block
     {
     public:
         Block(): prec(ggml::prec::GGML_PREC_DEFAULT), id(0), debug(false) {}
+        virtual ~Block() {}
         virtual ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input)
         {
             CHATLLM_THROW << "forward(ComputeContext *ctx, ggml::tensor *input): not implemented";
@@ -411,8 +432,13 @@ namespace chatllm
     {
     public:
         Embedding(InitContext *ctx, int num_embeddings, int embedding_dim)
+            : Embedding(ctx, ctx->dtype, num_embeddings, embedding_dim)
+        {
+        }
+
+        Embedding(InitContext *ctx, ggml::type dtype, int num_embeddings, int embedding_dim)
             : num_embeddings(num_embeddings), num_padded_embeddings(BlockParams::num_padding_embeddings),
-              weight(ggml::new_tensor_2d(ctx, ggml::type_fallback(ctx->dtype, embedding_dim), embedding_dim,
+              weight(ggml::new_tensor_2d(ctx, ggml::type_fallback(dtype, embedding_dim), embedding_dim,
                      num_embeddings + BlockParams::num_padding_embeddings))
         {
             ggml::set_input(weight);
@@ -581,7 +607,7 @@ namespace chatllm
         }
 
         using Block::forward;
-        ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input, int n_past) override;
+        ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input) override;
 
         int64_t get_param_num(bool effective_only) const override
         {
@@ -1274,10 +1300,10 @@ namespace chatllm
         void save_to_cache(ComputeContext *ctx, const int n_past, const int qlen, ggml::tensor *k, ggml::tensor *v) override;
 
         // output: [heads, qlen, head_size]
-        virtual ggml::tensor *get_k_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen);
+        ggml::tensor *get_k_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen) override;
 
         // output: [heads, head_size, klen]
-        virtual ggml::tensor *get_v_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen);
+        ggml::tensor *get_v_from_cache(ComputeContext *ctx, const int hidden_size, const int n_past, const int qlen) override;
 
     public:
         const int k_hidden_size;
@@ -1335,7 +1361,7 @@ namespace chatllm
                       int cache_length)
             : KVCacheAttention(ctx, num_attention_heads, num_kv_heads, head_dim * num_kv_heads, head_dim * num_kv_heads, max_length, cache_length),
               q_proj(ctx, hidden_size, head_dim * num_attention_heads, nullptr, qkv_bias),
-              k_proj(ctx, hidden_size, head_dim * num_kv_heads, nullptr, qkv_bias),
+              k_proj(ctx, hidden_size, head_dim * num_kv_heads, nullptr, BlockParams::OverrideKProjBiased::get(qkv_bias)),
               v_proj(ctx, hidden_size, head_dim * num_kv_heads, nullptr, qkv_bias),
               o_proj(ctx, head_dim * num_attention_heads, hidden_size, o_bias)
         {

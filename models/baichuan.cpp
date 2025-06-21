@@ -345,7 +345,7 @@ namespace m1
     class ConditionalGeneration : public BaseModelForConditionalGeneration
     {
     public:
-        typedef HeterogeneousModel<BaseConfig, Embedding, RMSNorm> ModelClass;
+        typedef HeterogeneousModel ModelClass;
 
     public:
         ConditionalGeneration(const Config &config, const RuntimeConfig &runtime_config, ModelType type = MODEL_TYPE_BAICHUAN_M1)
@@ -377,7 +377,10 @@ namespace m1
                 }
             };
 
-            transformer = new ModelClass(&w_ctx_, config, false, create_layer);
+            transformer = new ModelClass(&w_ctx_, config.num_hidden_layers, config.hidden_size,
+                create_embedding<Embedding>(&w_ctx_, config),
+                create_final_norm<RMSNorm>(&w_ctx_, config),
+                create_lm_head(&w_ctx_, config, false), create_layer);
 
             for (int i = 0; i < config.num_hidden_layers; i++)
             {
@@ -401,14 +404,9 @@ namespace m1
 
         void set_additional_args(const std::map<std::string, std::string> &args) override
         {
-            auto it = args.find("chat_template");
-            if (it != args.end())
-            {
-                if (it->second == "im")
-                {
+            if (utils::get_opt(args, "chat_template", "") == "im")
                     tokenizer->set_chat_encoder(&_im_chat_encoder);
-                }
-            }
+
         }
 
     private:

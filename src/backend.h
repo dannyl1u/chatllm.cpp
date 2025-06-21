@@ -18,10 +18,14 @@ namespace chatllm
                             ggml::type     type,
                             int            n_dims,
                             const int64_t *ne);
+        tensor *init_tensor(ggml::tensor  *tensor,
+                            ggml::type     type,
+                            int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3);
         void change_type(ggml::tensor  *tensor, ggml::type type);
 
         size_t element_size(const ggml::tensor *tensor);
         size_t nbytes(const ggml::tensor *tensor);
+        size_t tensor_overhead(void);
         int64_t nrows(const ggml::tensor *tensor);
         int64_t nelements(const ggml::tensor *tensor);
         int64_t block_size(const ggml::tensor *tensor);
@@ -415,6 +419,7 @@ namespace chatllm
 
         virtual size_t get_used_mem(void);
         virtual size_t get_mem_size(void);
+        virtual bool check_used_mem_size(bool assertion = true);
 
         virtual bool is_using_gpu(void) const { return backend_context->is_using_gpu(); }
 

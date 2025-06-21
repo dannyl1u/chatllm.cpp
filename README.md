@@ -1,6 +1,6 @@
 # ChatLLM.cpp
 
-[中文版](README_zh.md) | [日本語](README_ja.md)
+[中文版](README_zh.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![CI](https://github.com/foldl/chatllm.cpp/actions/workflows/build.yml/badge.svg)](https://github.com/foldl/chatllm.cpp/actions/workflows/build.yml)
 
@@ -13,6 +13,10 @@ pure C++ implementation based on [@ggerganov](https://github.com/ggerganov)'s [g
 
 **What's New:**
 
+* 2025-06-21: [I can hear](./docs/multimodal.md): Qwen2-Audio
+* 2025-06-10: SmolVLM2
+* 2025-06-07: MiniCPM4
+* 2025-06-06: Qwen-3 Embedding & Reranker
 * 2025-06-03: Kimi-VL
 * 2025-05-28: Gemma3 fully supported
 * 2025-05-23: [I can see](./docs/multimodal.md): Fuyu
@@ -88,7 +92,7 @@ pip install -r requirements.txt
 Use `convert.py` to transform models into quantized GGML format. For example, to convert the _fp16_ base model to q8_0 (quantized int8) GGML model, run:
 
 ```sh
-# For models such as ChatLLM-6B, ChatLLM2-6B, InternLM, LlaMA, LlaMA-2, Baichuan-2, etc
+# For models such as ChatLLM2-6B, InternLM, LlaMA, LlaMA-2, Baichuan-2, etc
 python convert.py -i path/to/model -t q8_0 -o quantized.bin --name ModelName
 
 # For some models such as CodeLlaMA, model type should be provided by `-a`
@@ -117,6 +121,12 @@ In order to build this project you have several different options.
   ```
 
   The executable is `./build/bin/main`.
+
+  There are lots of `GGML_...` options to play with. Example: Vulkan acceleration together with RPC and backend dynamic loading:
+
+  ```sh
+  cmake -B build -DGGML_VULKAN=1 -DGGML_RPC=1 -DGGML_CPU_ALL_VARIANTS=1 -DGGML_BACKEND_DL=1
+  ```
 
 ### Run
 

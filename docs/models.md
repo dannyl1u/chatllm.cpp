@@ -138,7 +138,8 @@
           [SFT-1B](https://huggingface.co/openbmb/MiniCPM-1B-sft-bf16)🔥
     * [x] [2B-128k](https://huggingface.co/openbmb/MiniCPM-2B-128k) (Note: `--temp 0` is recommended.)
     * [x] [MoE-8x2B](https://huggingface.co/openbmb/MiniCPM-MoE-8x2B)
-    * [x] [4B](https://huggingface.co/openbmb/MiniCPM3-4B)
+    * [x] v3: [4B](https://huggingface.co/openbmb/MiniCPM3-4B)
+    * [x] v4: [0.5B](https://huggingface.co/openbmb/BitCPM4-0.5B/tree/fcad2c603edb0663a36e56999016cbf2d7644ea1), [8B](https://huggingface.co/openbmb/MiniCPM4-8B/tree/cd838a273dde346b7c319d443f41ecd31a71f1b6), [8B-Survey](https://huggingface.co/openbmb/MiniCPM4-Survey/tree/f3e7ca37096dbedbdd48f6bacb29513b64e78667), [8B-MCP](https://huggingface.co/openbmb/MiniCPM4-MCP/commit/4a6cefeea3115ca8fc6b03e1879e912718ba6487)
 
 * Mistral (`MistralForCausalLM`, `MixtralForCausalLM`)
     * [x] Mistral: [Instruct-7B-v0.2](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2), [Instruct-7B-v0.3](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3)
@@ -280,11 +281,15 @@ Please use `--format completion` for these models.
         [SNAC-24kHz](https://huggingface.co/mlx-community/snac_24khz/tree/556af1cd3b1c5f2d294f6aa9bb886245d7b716ac) is used as codec.
         Use these additional command line options when converting: `--name Orpheus-TTS -a Orpheus-TTS --snac_model /path/to/snac_24kHz`
 
+        Use `--set voice XX` to select voice `XX`, such as `tara`. [More info](https://github.com/canopyai/Orpheus-TTS?tab=readme-ov-file#prompting).
+
 * OuteTTS:
     * [x] 1.0: [1B](https://huggingface.co/OuteAI/Llama-OuteTTS-1.0-1B/commit/911e296ce01148a01f3af9329163b0d298ac33a1), [0.6B](https://huggingface.co/OuteAI/OuteTTS-1.0-0.6B/tree/e7bcd87b0ca47fd8c46317c8f745a5e4e19c7b5c)
 
         [DAC.speech.v1.0 1.5kbps](https://huggingface.co/ibm-research/DAC.speech.v1.0/commits/main) is used as codec.
         Use these additional command line options when converting: `--name OuteTTS -a OuteTTS --dac_model /path/to/dac`
+
+        Use `--set speaker /path/to/speaker.json` to select a speaker profile. [More info](https://github.com/edwko/OuteTTS/blob/main/docs/interface_usage.md#creating-custom-speaker-profiles).
 
 ## Multimodal Models
 
@@ -295,10 +300,18 @@ Please use `--format completion` for these models.
     * [x] v3: [Instruct-4B](https://huggingface.co/google/gemma-3-4b-it/tree/dbd91bbaf64a0e591f4340ce8b66fd1dba9ab6bd), [Instruct-12B](https://huggingface.co/google/gemma-3-12b-it/tree/7553b6f39c33dc229bfbfe3831f7bcdbb6b738c7), [Instruct-27B](https://huggingface.co/google/gemma-3-27b-it/tree/dfb98f29ff907e391ceed2be3834ca071ea260f1)
     * [x] MedGemma: [Instruct-4B](https://huggingface.co/google/medgemma-4b-it/commit/698f7911b8e0569ff4ebac5d5552f02a9553063c)
 
-    Note: Only download `tokenizer.model` and DO NOT download `tokenizer.json` when converting.
+    Note: Only download `tokenizer.model` and DO NOT download `tokenizer.json` when converting. Use `--set do-pan-and-scan 1` to enable _Pan and Scan_.
 
 * Kimi (`KimiVLForConditionalGeneration`)
     * [x] VL: [A3B-Instruct](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/tree/7a3c132a7b0f1f1677f5a72f258bd3afded7d357), [A3B-Thinking](https://huggingface.co/moonshotai/Kimi-VL-A3B-Thinking/commit/16681d8ac24e505088698e4e34ea494dd6e24400)
+
+* Qwen (`Qwen2AudioForConditionalGeneration`)
+    * [x] Qwen2-Audio: [7B-Instruct](https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/tree/0a095220c30b7b31434169c3086508ef3ea5bf0a)
+
+* SmolVLM2 (`SmolVLMForConditionalGeneration`)
+    * [x] [2.2B-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM2-2.2B-Instruct/tree/482adb537c021c86670beed01cd58990d01e72e4)
+
+    Note: Use `--set do-split 1` to enable _Split_.
 
 ## RAG Models
 
@@ -309,10 +322,13 @@ Please use `--format completion` for these models.
 
         Note: Only dense embedding is implemented.
 
+    * Qwen-3 Embedding: [0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/tree/b22da495047858cce924d27d76261e96be6febc0), [4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B/tree/636cd9bf47d976946cdbb2b0c3ca0cb2f8eea5ff), [8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B/commit/4e423935c619ae4df87b646a3ce949610c66241c)
+
 * QA Ranking (`XLMRobertaForSequenceClassification`)
     * [x] [BCE-ReRanker](https://huggingface.co/maidalun1020/bce-reranker-base_v1)
     * [x] [BGE-ReRanker-M3](https://huggingface.co/BAAI/bge-reranker-v2-m3) (`-a BGE-Reranker-M3`)
     * [x] [MiniCPM-Reranker-Light](https://huggingface.co/openbmb/MiniCPM-Reranker-Light)
+    * [x] Qwen-3 Reranker: [0.6B](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B/tree/ad4c588e592307dad69ff0fabc1b3ca5ea8e9f76), [4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B/tree/57906229d41697e4494d50ca5859598cf86154a1), [8B](https://huggingface.co/Qwen/Qwen3-Reranker-8B/tree/d678ef8b29dd0eb9d784473da5d5169b21ec948a)
 
 ## LoRA Models
 

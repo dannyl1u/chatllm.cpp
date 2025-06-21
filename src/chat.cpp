@@ -48,6 +48,17 @@ namespace chatllm
         return str;
     }
 
+    ContentPiece::Type ContentPiece::type_parse(const char *s)
+    {
+        if (strcmp(s, "image") == 0)
+            return ContentPiece::Type::Image;
+        if (strcmp(s, "audio") == 0)
+            return ContentPiece::Type::Audio;
+        if (strcmp(s, "video") == 0)
+            return ContentPiece::Type::Video;
+        return ContentPiece::Type::Text;
+    }
+
     Content::Content(Messages *owner, const std::string &content) : owner(owner)
     {
         push_back(content);
@@ -101,6 +112,17 @@ namespace chatllm
             {
                 auto tag  = inner.substr(0, pos);
                 auto path = inner.substr(pos + 1);
+                // remove quotes
+                if (path.size() >= 2)
+                {
+                    if ((path[0] == '"') && (path.back() == '"'))
+                    {
+                        path = path.substr(1, path.size() - 2);
+                    }
+                }
+
+                if (path.size() == 0) continue;
+
                 if (tag == "image")
                 {
                     push_back(path, ContentPiece::Type::Image);
@@ -274,9 +296,8 @@ namespace chatllm
         mm_closing = closing;
     }
 
-    void Messages::push_back(const Message &m)
+    void Messages::push_back(const Content &content, MsgRole role)
     {
-        MsgRole role = m.role;
         if (MsgRole::Auto == role)
         {
             if (history.size() > 0)
@@ -307,7 +328,7 @@ namespace chatllm
             if (role == last.role)
             {
                 last.content.push_back(sep);
-                last.content.push_back(m.content);
+                last.content.push_back(content);
                 return;
             }
         }
@@ -319,7 +340,12 @@ namespace chatllm
                 round++;
         }
 
-        history.emplace_back(this, m.content, role, round);
+        history.emplace_back(this, content, role, round);
+    }
+
+    void Messages::push_back(const Message &m)
+    {
+        push_back(m.content, m.role);
     }
 
     void Messages::push_back(const std::string &content, MsgRole role)
@@ -611,6 +637,11 @@ namespace chatllm
 
         input = preprocess(a);
         tp->Encode(input, &ids);
+    }
+
+    void BaseTokenizer::encode_embedding(const std::string &text, std::vector<int> &ids, EmbeddingPurpose purpose) const
+    {
+        encode(text, ids);
     }
 
     std::vector<int> BaseTokenizer::encode(const std::string &text) const
@@ -1851,11 +1882,11 @@ namespace chatllm
         tokenizer->encode(input, result);
     }
 
-    void Pipeline::text_embedding(const std::string &input, const GenerationConfig &gen_config, std::vector<float> &result)
+    void Pipeline::text_embedding(const std::string &input, const GenerationConfig &gen_config, std::vector<float> &result, BaseTokenizer::EmbeddingPurpose purpose)
     {
         if (!modelobj.loaded) return;
         std::vector<int> input_ids;
-        tokenizer->encode(input, input_ids);
+        tokenizer->encode_embedding(input, input_ids, purpose);
         model->text_embedding(gen_config, input_ids, result);
     }
 
@@ -2094,7 +2125,7 @@ namespace chatllm
             }
         }
 
-        text_embedding(rewritten_query, gen_config, query_emb);
+        text_embedding(rewritten_query, gen_config, query_emb, BaseTokenizer::EmbeddingPurpose::Query);
 
         vs.get()->Query(query_emb, selected, retrieve_top_n);
 

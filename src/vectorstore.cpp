@@ -457,4 +457,181 @@ namespace utils
             }
         }
     }
+
+    std::string load_file(const char *fn)
+    {
+        std::ifstream file(fn);
+        if (!file.is_open()) return "";
+
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+
+        return buffer.str();
+    }
+
+    std::string num2words(int value)
+    {
+        if (value < 0)
+            return "minus " + num2words(-value);
+
+        if (value == 0)
+            return "zero";
+
+        const static std::vector<std::string> units = {"", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"};
+        const static std::vector<std::string> teens = {"ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"};
+        const static std::vector<std::string> tens = {"", "ten", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"};
+
+        std::string result;
+
+        if (value >= 1000000000) {
+            int billion = value / 1000000000;
+            result += num2words(billion) + " billion";
+            value %= 1000000000;
+            if (value > 0) {
+                result += ", ";
+            }
+        }
+
+        if (value >= 1000000) {
+            int million = value / 1000000;
+            result += num2words(million) + " million";
+            value %= 1000000;
+            if (value > 0) {
+                result += ", ";
+            }
+        }
+
+        if (value >= 1000) {
+            int thousand = value / 1000;
+            result += num2words(thousand) + " thousand";
+            value %= 1000;
+            if (value > 0) {
+                result += ", ";
+            }
+        }
+
+        if (value >= 100) {
+            int hundred = value / 100;
+            result += units[hundred] + " hundred";
+            value %= 100;
+            if (value > 0) {
+                result += " and ";
+            }
+        }
+
+        if (value >= 20)
+        {
+            int ten = value / 10;
+            result += tens[ten];
+            value %= 10;
+
+            if (value > 0)
+            {
+                result += "-" + units[value];
+            }
+        }
+        else if (value >= 10)
+        {
+            result += teens[value - 10];
+        }
+        else if (value >= 1)
+        {
+            result += units[value];
+        }
+
+        return result;
+    }
+
+    std::string sec2hms(float seconds, bool show_ms)
+    {
+        int sec = (int)seconds;
+        int ms  = (int)((seconds - sec) * 1000000);
+        int min = sec / 60;
+        int hh  = min / 60;
+        sec %= 60;
+        min %= 60;
+        char s[100];
+        if (show_ms)
+            sprintf(s, "%d:%02d:%02d.%06d", hh, min, sec, ms);
+        else
+            sprintf(s, "%d:%02d:%02d", hh, min, sec);
+        return s;
+    }
+
+    std::string sec2ms(float seconds, bool show_ms)
+    {
+        int sec = (int)seconds;
+        int ms  = (int)((seconds - sec) * 1000000);
+        int min = sec / 60;
+        sec %= 60;
+        char s[100];
+        if (show_ms)
+            sprintf(s, "%02d:%02d.%06d", min, sec, ms);
+        else
+            sprintf(s, "%02d:%02d", min, sec);
+        return s;
+    }
+
+    std::string tmpname(void)
+    {
+        // Note: theoretically unsafe!
+        return std::tmpnam(nullptr);
+    }
+
+    bool is_same_command_option(const char *a, const char *b)
+    {
+        while (*a && *b)
+        {
+            char ca = *a;
+            char cb = *b;
+            if (ca == '-') ca = '_';
+            if (cb == '-') cb = '_';
+            if (ca != cb)
+                return false;
+            a++;
+            b++;
+        }
+
+        return *a == *b;
+    }
+
+    bool is_same_command_option(const std::string &a, const std::string &b)
+    {
+        return is_same_command_option(a.c_str(), b.c_str());
+    }
+
+    int         get_opt(const std::map<std::string, std::string> &options, const char *key, int def)
+    {
+        auto s = get_opt(options, key, "");
+        return s == "" ? def : std::atoi(s.c_str());
+    }
+
+    double      get_opt(const std::map<std::string, std::string> &options, const char *key, double def)
+    {
+        auto s = get_opt(options, key, "");
+        return s == "" ? def : std::atof(s.c_str());
+    }
+
+    bool        get_opt(const std::map<std::string, std::string> &options, const char *key, const bool def)
+    {
+        auto s = get_opt(options, key, "");
+        if (s == "") return def;
+        if (s == "0") return false;
+        if (s == "false") return false;
+        return true;
+    }
+
+    std::string get_opt(const std::map<std::string, std::string> &options, const char *key, const std::string &def)
+    {
+        return get_opt(options, key, def.c_str());
+    }
+
+    std::string get_opt(const std::map<std::string, std::string> &options, const char *key, const char *def)
+    {
+        for (auto k : options)
+        {
+            if (is_same_command_option(k.first, key)) return k.second;
+        }
+        return def;
+    }
 }

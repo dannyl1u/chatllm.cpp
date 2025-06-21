@@ -84,6 +84,8 @@ namespace chatllm
             return *this;
         }
 
+        static Type type_parse(const char *s);
+
     public:
         std::string content;
         Type type;
@@ -162,6 +164,7 @@ namespace chatllm
         Messages(const std::string &opening, const std::string &closing);
 
         void push_back(const std::string &content, MsgRole role);
+        void push_back(const Content &content, MsgRole role);
         void push_back(const Message &m);
         void clear(void);
 
@@ -244,12 +247,21 @@ namespace chatllm
     public:
         struct MediaAsEmbeddingVector
         {
-            int grid_width;
-            int grid_height;
-            int patch_size;
+            int width  = -1;
+            int height = -1;
+            int grid_width  = -1;
+            int grid_height = -1;
+            int patch_size  = 0;
             int emb_vec_number;
             std::vector<float> data;
         };
+
+        enum EmbeddingPurpose
+        {
+            Document,
+            Query,
+        };
+
     public:
         BaseTokenizer(const BaseConfig &config,
                         BaseHistoryEncoder *chat_encoder,
@@ -268,6 +280,7 @@ namespace chatllm
         virtual void encode_external_text_completion(const std::string &text, std::vector<int> &ids) const;
 
         virtual void encode_qa(const std::string &q, const std::string &a, std::vector<int> &ids) const;
+        virtual void encode_embedding(const std::string &text, std::vector<int> &ids, EmbeddingPurpose purpose) const;
 
         virtual std::string decode(const std::vector<int> &ids) const;
 
@@ -431,6 +444,30 @@ namespace chatllm
     private:
         InitContext *ctx;
         ggml::type   _type;
+    };
+
+    class TypeChanger
+    {
+    public:
+        TypeChanger(InitContext *ctx, ggml::type dtype): ctx(ctx)
+        {
+            _type = ctx->cache_dtype;
+            ctx->dtype = dtype;
+        }
+
+        ~TypeChanger()
+        {
+            ctx->dtype = _type;
+        }
+
+        operator InitContext *() const
+        {
+            return ctx;
+        }
+    private:
+        InitContext *ctx;
+        ggml::type   _type;
+
     };
 
     class LayerMover
@@ -791,9 +828,12 @@ namespace chatllm
         bool do_sample;
         bool reversed_role;
         int top_k;
+        int penalty_window;
         float top_p;
         float temperature;
         float presence_penalty;
+        float repeat_penalty;
+        float frequency_penalty;
         float tfs_z;
         std::string sampling;
         std::string ai_prefix;
@@ -1317,7 +1357,7 @@ namespace chatllm
         void set_extending_method(ExtendingMethod method);
         virtual void set_additional_args(const std::map<std::string, std::string> &args);
 
-        void text_embedding(const std::string &input, const GenerationConfig &gen_config, std::vector<float> &result);
+        void text_embedding(const std::string &input, const GenerationConfig &gen_config, std::vector<float> &result, BaseTokenizer::EmbeddingPurpose purpose = BaseTokenizer::EmbeddingPurpose::Document);
         void text_tokenize(const std::string &input, const GenerationConfig &gen_config, std::vector<int> &result);
         float qa_rank(const std::string &q, const std::string &a, const GenerationConfig &gen_config);
 

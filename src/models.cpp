@@ -22,6 +22,7 @@
 #include "layers.h"
 #include "JSON.h"
 #include "vision_process.h"
+#include "audio_process.h"
 
 json::JSON json::JSON::_null = json::JSON();
 
@@ -141,7 +142,6 @@ namespace chatllm
         }
 
         printf("\n");
-        exit(-1);
     }
 
     static bool need_observe_tensor_evaluation_callback(ggml::tensor *tensor, void *user_data)
@@ -204,6 +204,7 @@ namespace chatllm
 
     #define MAKE_TYPE_TAG(v)            (((uint32_t)(v) >> 1) << 24)
     #define MODEL_TYPE_TAG_ChatImageIn                              MAKE_TYPE_TAG(ChatModelAccessPoint::Text + ChatModelAccessPoint::ImageInput)
+    #define MODEL_TYPE_TAG_ChatAudioIn                              MAKE_TYPE_TAG(ChatModelAccessPoint::Text + ChatModelAccessPoint::AudioInput)
     #define MODEL_TYPE_TAG_ChatImageInVideoIn                       MAKE_TYPE_TAG(ChatModelAccessPoint::Text + ChatModelAccessPoint::ImageInput + ChatModelAccessPoint::VideoInput)
     #define MODEL_TYPE_TAG_ChatImageInVideoInAudioInAudioOut        MAKE_TYPE_TAG(ChatModelAccessPoint::Text + ChatModelAccessPoint::ImageInput + ChatModelAccessPoint::VideoInput + ChatModelAccessPoint::AudioInput + ChatModelAccessPoint::AudioOutput)
 
@@ -297,6 +298,7 @@ namespace chatllm
         MODEL_TYPE_MINICPM2 = 0x1101,
         MODEL_TYPE_MINICPM_MoE = 0x1102,
         MODEL_TYPE_MINICPM3 = 0x1110,
+        MODEL_TYPE_MINICPM4 = 0x1111,
 
         MODEL_TYPE_PERSIMMON= 0x1200,
         MODEL_TYPE_FUYU     = 0x1201,
@@ -359,15 +361,19 @@ namespace chatllm
         MODEL_TYPE_ORPHEUS_TTS              = 0x10000106,
         MODEL_TYPE_OUTE_TTS_LLAMA           = 0x10000107,
         MODEL_TYPE_OUTE_TTS_QWEN3           = 0x10000108,
+        MODEL_TYPE_QWEN3_Embedding          = 0x10000109,
+        MODEL_TYPE_QWEN3_ReRanker           = 0x1000010A,
 
         MODEL_TYPE_LLAMA_MULTI      = 0x20000001,
 
         MODEL_TYPE_LLAMA4           = MODEL_TYPE_TAG_ChatImageIn + 0x0000001,
         MODEL_TYPE_GEMMA3Vis        = MODEL_TYPE_TAG_ChatImageIn + 0x0000011,
 
-        MODEL_TYPE_QWEN2_5_VL       = MODEL_TYPE_TAG_ChatImageInVideoIn + 0x0000001,
+        MODEL_TYPE_QWEN2_AUDIO      = MODEL_TYPE_TAG_ChatAudioIn + 0x0000001,
 
+        MODEL_TYPE_QWEN2_5_VL       = MODEL_TYPE_TAG_ChatImageInVideoIn + 0x0000001,
         MODEL_TYPE_KIMI_VL          = MODEL_TYPE_TAG_ChatImageInVideoIn + 0x0000100,
+        MODEL_TYPE_SMOL_VLM         = MODEL_TYPE_TAG_ChatImageInVideoIn + 0x0000200,
     };
 
     ModelPurpose get_model_purpose(ModelType model_type)
@@ -377,10 +383,12 @@ namespace chatllm
         case MODEL_TYPE_BCE_Embedding:
         case MODEL_TYPE_BGE_M3:
         case MODEL_TYPE_MiniCPM_Embedding_Light:
+        case MODEL_TYPE_QWEN3_Embedding:
             return ModelPurpose::TextEmbedding;
         case MODEL_TYPE_BCE_ReRanker:
         case MODEL_TYPE_BGE_ReRanker_M3:
         case MODEL_TYPE_MiniCPM_ReRanker_Light:
+        case MODEL_TYPE_QWEN3_ReRanker:
             return ModelPurpose::Ranker;
         case MODEL_TYPE_ORPHEUS_TTS:
         case MODEL_TYPE_OUTE_TTS_LLAMA:
@@ -721,20 +729,113 @@ namespace chatllm
         }
     }
 
+    class LogitsPenalty
+    {
+    public:
+        LogitsPenalty()
+            : repeat_penalty_en(false),
+              freq_penalty_en(false),
+              inv_repeat_penalty(0.0f), repeat_penalty(0.0f), freq_penalty(0.0f), presence_penalty(0.0f)
+        {}
+
+        LogitsPenalty(const GenerationConfig &gen_config)
+            : repeat_penalty_en((gen_config.penalty_window > 0) && (gen_config.repeat_penalty != 1.0f) && (gen_config.repeat_penalty > 0.0f)),
+              freq_penalty_en((gen_config.penalty_window > 0) && ((gen_config.frequency_penalty != 0.0f) || (gen_config.presence_penalty != 0.0f))),
+              inv_repeat_penalty(repeat_penalty_en ? 1 / gen_config.repeat_penalty : 0.0f),
+              repeat_penalty(gen_config.repeat_penalty),
+              freq_penalty(freq_penalty_en ? gen_config.frequency_penalty / gen_config.penalty_window : 0.0f),
+              presence_penalty(gen_config.presence_penalty)
+        {
+            if (gen_config.penalty_window > 0)
+            {
+                token_history.resize(gen_config.penalty_window);
+            }
+            reset();
+        }
+
+        virtual void skip_this(int token_id)
+        {
+            skip_tokens.emplace(token_id);
+        }
+
+        virtual void reset()
+        {
+            for (size_t i = 0; i < token_history.size(); i++)
+                token_history[i] = -1;
+            hist_write = 0;
+            memset(token_count.data(), 0, token_count.size() * sizeof(token_count[0]));
+        }
+
+        virtual void accept_choice(int token_id)
+        {
+            if (token_history.size() < 1) return;
+            int id = token_history[hist_write];
+            if ((0 <= id) && (id < (int)token_count.size()))
+                token_count[id]--;
+            token_history[hist_write++] = token_id;
+            if (hist_write >= token_history.size()) hist_write = 0;
+            if ((0 <= token_id) && (token_id < (int)token_count.size()))
+                token_count[token_id]++;
+        }
+
+        virtual void process(float *logits, const int vocab_size)
+        {
+            if (token_history.size() < 1) return;
+
+            if (vocab_size != (int)token_count.size())
+            {
+                token_count.resize(vocab_size);
+            }
+
+            for (int i = 0; i < vocab_size; i++)
+            {
+                if (repeat_penalty_en)
+                {
+                    if (token_count[i] > 0)
+                        logits[i] *= logits[i] > 0 ? inv_repeat_penalty : repeat_penalty;
+                }
+
+                if (freq_penalty_en)
+                    logits[i] -= float(token_count[i]) * freq_penalty + float(token_count[i] > 0) * presence_penalty;
+            }
+        }
+
+    protected:
+        const bool repeat_penalty_en;
+        const bool freq_penalty_en;
+        const float inv_repeat_penalty;
+        const float repeat_penalty;
+        const float freq_penalty;
+        const float presence_penalty;
+        std::vector<int> token_history;
+        std::vector<int> token_count;
+        size_t hist_write;
+        std::set<int> skip_tokens;
+    };
+
     class Sampler
     {
     public:
         static const int ABORT = -1;
+        Sampler() : penalty() {}
 
+        Sampler(const GenerationConfig &gen_config)
+            : penalty(gen_config)
+        {}
     public:
         virtual void seed(int x)
         {
             gen.seed((unsigned int)x);
         }
 
-        virtual void reset() {}
+        virtual void reset()
+        {
+            penalty.reset();
+        }
 
         virtual int sampling(float *logits, const int vocab_size) = 0;
+    public:
+        LogitsPenalty penalty;
     protected:
         std::mt19937 gen;
     };
@@ -751,40 +852,26 @@ namespace chatllm
     class NonGreedySampler: public Sampler
     {
     public:
-        NonGreedySampler(float temperature, float presence_penalty, int top_k)
-            : inv_temp(0.0f), inv_presence_penalty(0.0f), presence_penalty(presence_penalty), top_k(top_k)
+        NonGreedySampler(const GenerationConfig &gen_config, float temperature, int top_k)
+            : Sampler(gen_config),
+              inv_temp(0.0f), top_k(top_k)
         {
             temp_en = fabs(temperature - 1.0f) > 1e-5f;
             if (temp_en) inv_temp = 1.f / temperature;
-
-            presence_penalty_en = fabs(presence_penalty - 1.0f) > 1e-5f;
-            if (presence_penalty_en) inv_presence_penalty = 1.0f / presence_penalty;
         }
 
-        void reset() override
-        {
-            g.clear();
-        }
 
         int sampling(float *logits, const int vocab_size) override
         {
-            g.resize(vocab_size, 0);
-            token_scores.resize(vocab_size);
-
             if (temp_en)
             {
                 for (int i = 0; i < vocab_size; i++)
                     logits[i] *= inv_temp;
             }
 
-            if (presence_penalty_en)
-            {
-                for (int i = 0; i < vocab_size; i++)
-                {
-                    if (g[i] > 0)
-                        logits[i] *= logits[i] > 0 ? inv_presence_penalty : presence_penalty;
-                }
-            }
+            penalty.process(logits, vocab_size);
+
+            token_scores.resize(vocab_size);
 
             for (int i = 0; i < vocab_size; i++)
             {
@@ -813,7 +900,8 @@ namespace chatllm
             std::discrete_distribution<> dist(logits, logits + token_scores.size());
             int next_token_id = token_scores[dist(gen)].id;
 
-            g[next_token_id] += 1;
+            penalty.accept_choice(next_token_id);
+
             return next_token_id;
         }
 
@@ -846,20 +934,16 @@ namespace chatllm
 
         virtual void do_sampling(float *logits, const int vocab_size) = 0;
         bool temp_en;
-        bool presence_penalty_en;
         float inv_temp;
-        float inv_presence_penalty;
-        float presence_penalty;
         int top_k;
         std::vector<TokenIdScore> token_scores;
-        std::vector<int> g;
     };
 
     class TopPSampler : public NonGreedySampler
     {
     public:
-        TopPSampler(float temperature, float presence_penalty, int top_k, float top_p)
-            : NonGreedySampler(temperature, presence_penalty, top_k), top_p(top_p)
+        TopPSampler(const GenerationConfig &gen_config, float temperature, int top_k, float top_p)
+            : NonGreedySampler(gen_config, temperature, top_k), top_p(top_p)
         {}
 
     protected:
@@ -895,8 +979,8 @@ namespace chatllm
     class FreeTailSampler : public NonGreedySampler
     {
     public:
-        FreeTailSampler(float temperature, float presence_penalty, int top_k, float z)
-            : NonGreedySampler(temperature, presence_penalty, top_k), z(z)
+        FreeTailSampler(const GenerationConfig &gen_config, float temperature, int top_k, float z)
+            : NonGreedySampler(gen_config, temperature, top_k), z(z)
         {}
 
     protected:
@@ -952,9 +1036,9 @@ namespace chatllm
             if (gen_config.do_sample)
             {
                 if (gen_config.sampling == "top_p")
-                    r = new TopPSampler(gen_config.temperature, gen_config.presence_penalty, gen_config.top_k, gen_config.top_p);
+                    r = new TopPSampler(gen_config, gen_config.temperature, gen_config.top_k, gen_config.top_p);
                 else if (gen_config.sampling == "tfs")
-                    r = new FreeTailSampler(gen_config.temperature, gen_config.presence_penalty, gen_config.top_k, gen_config.tfs_z);
+                    r = new FreeTailSampler(gen_config, gen_config.temperature, gen_config.top_k, gen_config.tfs_z);
                 else if (gen_config.sampling != "greedy")
                     CHATLLM_CHECK(false) << "unknown sampling algorithm: " << gen_config.sampling;
             }
@@ -966,20 +1050,6 @@ namespace chatllm
             return r;
         }
     };
-
-    class ModelBlock: public Block
-    {
-    public:
-        virtual int save_session(FILE *f) = 0;
-        virtual int load_session(FILE *f) = 0;
-
-        virtual int save_session(ModelSessionMemory &session) const = 0;
-        virtual int load_session(ModelSessionMemory &session) = 0;
-
-        virtual void load(const std::string &path, TensorLoader *loader, const std::vector<int> &layer_ids) = 0;
-    };
-
-
 
     class BaseModelForConditionalGeneration : public BaseModel
     {
@@ -1408,224 +1478,250 @@ namespace chatllm
         return oss.str();
     }
 
-    template <class Config, class Embedding, class FinalNorm> class HeterogeneousModel : public ModelBlock
+    HeterogeneousModel::HeterogeneousModel(InitContext *ctx, int num_hidden_layers, int hidden_size,
+        Block *word_embeddings, Block *final_layernorm,
+        Block *lm_head, std::function<Block *(InitContext *, int)> create_layer)
+    : num_hidden_layers(num_hidden_layers), hidden_size(hidden_size),
+        word_embeddings(word_embeddings),
+        final_layernorm(final_layernorm),
+        lm_head(lm_head),
+        logits_pp(nullptr),
+        cache_size(0),
+        final_steps(std::make_unique<LMFinalSteps>())
     {
-    public:
-        HeterogeneousModel() = default;
-
-        HeterogeneousModel(InitContext *ctx, const Config &config, bool lm_head_bias, std::function<Block *(InitContext *, int)> create_layer)
-                : HeterogeneousModel(ctx, config, new Linear(LayerMover(ctx, LayerAllocatorManager::MiscLayer::Epilog), config.hidden_size, config.vocab_size, lm_head_bias), create_layer)
-        {}
-
-        HeterogeneousModel(InitContext *ctx, const Config &config, Block *lm_head, std::function<Block *(InitContext *, int)> create_layer)
-        : config(config),
-          word_embeddings(LayerMover(ctx, LayerAllocatorManager::MiscLayer::Prolog), config.vocab_size, config.hidden_size, config.max_length),
-          final_layernorm(LayerMover(ctx, LayerAllocatorManager::MiscLayer::Epilog), config.hidden_size),
-          lm_head(lm_head), logits_pp(nullptr),
-          cache_size(0)
+        layers.reserve(num_hidden_layers);
+        for (int layer_id = 0; layer_id < num_hidden_layers; layer_id++)
         {
-            layers.reserve(config.num_hidden_layers);
-            for (int layer_id = 0; layer_id < config.num_hidden_layers; layer_id++)
-            {
-                ctx->move_to_layer(layer_id);
-                auto layer = create_layer(ctx, layer_id);
-                layers.emplace_back(layer);
+            ctx->move_to_layer(layer_id);
+            auto layer = create_layer(ctx, layer_id);
+            layers.emplace_back(layer);
 
-                layer->set_id(layer_id);
-                cache_size += layer->get_cache_size();
+            layer->set_id(layer_id);
+            cache_size += layer->get_cache_size();
 
-                auto allocator = ctx->get_allocator();
-                auto buf = allocator->alloc(layer->get_cache_size(), BackendBufAllocator::Usage::Matrix);
-                layer->set_cache_buffer(buf);
-            }
+            auto allocator = ctx->get_allocator();
+            auto buf = allocator->alloc(layer->get_cache_size(), BackendBufAllocator::Usage::Matrix);
+            layer->set_cache_buffer(buf);
+        }
+    }
+
+    HeterogeneousModel::~HeterogeneousModel()
+    {
+        if (word_embeddings) delete word_embeddings;
+        if (final_layernorm) delete final_layernorm;
+        if (lm_head) delete lm_head;
+        for (auto b : layers) delete b;
+    }
+
+    ggml::tensor *HeterogeneousModel::forward(ComputeContext *ctx, ggml::tensor *input_ids, int n_past)
+    {
+        before_forward(ctx, input_ids, n_past);
+
+        ctx->move_to_layer(LayerAllocatorManager::Prolog);
+        ggml::tensor *hidden_states = word_embeddings->forward(ctx, input_ids);
+        for (auto &layer : layers)
+        {
+            ctx->move_to_layer(layer->get_id());
+            hidden_states = layer->forward(ctx, hidden_states, n_past);
         }
 
-        ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input_ids, int n_past) override
+        ctx->move_to_layer(LayerAllocatorManager::Epilog);
+        return final_steps->forward(this, ctx, input_ids, hidden_states);
+    }
+
+    void HeterogeneousModel::set_ctx(int n_ctx)
+    {
+        for (auto &layer : layers)
+            layer->set_ctx(n_ctx);
+    }
+
+    void HeterogeneousModel::shift_cache(int shift, int total)
+    {
+        for (auto &layer : layers)
+            layer->shift_cache(shift, total);
+    }
+
+    int64_t HeterogeneousModel::get_param_num(bool effective_only) const
+    {
+        int64_t r = 0;
+        r += word_embeddings->get_param_num(effective_only);
+        r += get_param_num_of_layers(effective_only);
+        r += final_layernorm->get_param_num(effective_only);
+        if (lm_head)
+            r += lm_head->get_param_num(effective_only);
+        if (logits_pp)
+            r += logits_pp->get_param_num(effective_only);
+        return r;
+    }
+
+    Block *HeterogeneousModel::get_layer(int index)
+    {
+        return layers[index];
+    }
+
+    void HeterogeneousModel::set_final_steps(std::unique_ptr<ModelFinalSteps> final_steps)
+    {
+        this->final_steps = std::move(final_steps);
+    }
+
+    ModelFinalSteps *HeterogeneousModel::get_final_steps()
+    {
+        return final_steps.get();
+    }
+
+    int HeterogeneousModel::save_session(FILE *f)
+    {
+        struct state state = {.cache_size = cache_size };
+        if (fwrite(&state, sizeof(state), 1, f) != 1)
+            return -1;
+
+        std::vector<uint8_t> buffer;
+
+        for (int layer_id = 0; layer_id < num_hidden_layers; layer_id++)
         {
-            before_forward(ctx, input_ids, n_past);
-
-            ctx->move_to_layer(LayerAllocatorManager::Prolog);
-            ggml::tensor *hidden_states = word_embeddings.forward(ctx, input_ids);
-            for (auto &layer : layers)
-            {
-                ctx->move_to_layer(layer->get_id());
-                hidden_states = layer->forward(ctx, hidden_states, n_past);
-            }
-
-            ctx->move_to_layer(LayerAllocatorManager::Epilog);
-            return final_steps(ctx, input_ids, hidden_states);
+            auto layer = layers[layer_id];
+            buffer.resize(layer->get_cache_size());
+            size_t size = layer->read_cache_data(buffer.data(), buffer.size());
+            if (size != buffer.size())
+                return -4;
+            if (fwrite(buffer.data(), 1, size, f) != size)
+                return -3;
         }
 
-        void set_ctx(int n_ctx) override
+        return 0;
+    }
+
+    int HeterogeneousModel::load_session(FILE *f)
+    {
+        struct state state = {0};
+        if (fread(&state, sizeof(state), 1, f) != 1)
+            return -10;
+        if (state.cache_size != cache_size)
+            return -1;
+
+        std::vector<uint8_t> buffer;
+
+        for (int layer_id = 0; layer_id < num_hidden_layers; layer_id++)
         {
-            for (auto &layer : layers)
-                layer->set_ctx(n_ctx);
+            auto layer = layers[layer_id];
+            buffer.resize(layer->get_cache_size());
+            if (fread(buffer.data(), 1, buffer.size(), f) != buffer.size())
+                return -4;
+            size_t size = layer->write_cache_data(buffer.data(), buffer.size());
+            if (size != buffer.size())
+                return -3;
         }
 
-        void shift_cache(int shift, int total) override
-        {
-            for (auto &layer : layers)
-                layer->shift_cache(shift, total);
-        }
+        return 0;
+    }
 
-        int64_t get_param_num(bool effective_only) const override
+    int HeterogeneousModel::save_session(ModelSessionMemory &session) const
+    {
+        for (int layer_id = 0; layer_id < num_hidden_layers; layer_id++)
         {
-            int64_t r = 0;
-            r += word_embeddings.get_param_num(effective_only);
-            r += get_param_num_of_layers(effective_only);
-            r += final_layernorm.get_param_num(effective_only);
-            if (lm_head)
-                r += lm_head->get_param_num(effective_only);
-            if (logits_pp)
-                r += logits_pp->get_param_num(effective_only);
-            return r;
-        }
-
-        Block *get_layer(int index)
-        {
-            return layers[index];
-        }
-
-        int save_session(FILE *f) override
-        {
-            struct state state = {.cache_size = cache_size };
-            if (fwrite(&state, sizeof(state), 1, f) != 1)
+            auto layer = layers[layer_id];
+            const size_t size = layer->get_cache_size();
+            void *buf = session.prepare_buffer(layer_id, size);
+            if (layer->read_cache_data(buf, size) != size)
                 return -1;
-
-            std::vector<uint8_t> buffer;
-
-            for (int layer_id = 0; layer_id < config.num_hidden_layers; layer_id++)
-            {
-                auto layer = layers[layer_id];
-                buffer.resize(layer->get_cache_size());
-                size_t size = layer->read_cache_data(buffer.data(), buffer.size());
-                if (size != buffer.size())
-                    return -4;
-                if (fwrite(buffer.data(), 1, size, f) != size)
-                    return -3;
-            }
-
-            return 0;
         }
 
-        int load_session(FILE *f) override
+        return 0;
+    }
+
+    int HeterogeneousModel::load_session(ModelSessionMemory &session)
+    {
+        for (int layer_id = 0; layer_id < num_hidden_layers; layer_id++)
         {
-            struct state state = {0};
-            if (fread(&state, sizeof(state), 1, f) != 1)
-                return -10;
-            if (state.cache_size != cache_size)
-                return -1;
-
-            std::vector<uint8_t> buffer;
-
-            for (int layer_id = 0; layer_id < config.num_hidden_layers; layer_id++)
-            {
-                auto layer = layers[layer_id];
-                buffer.resize(layer->get_cache_size());
-                if (fread(buffer.data(), 1, buffer.size(), f) != buffer.size())
-                    return -4;
-                size_t size = layer->write_cache_data(buffer.data(), buffer.size());
-                if (size != buffer.size())
-                    return -3;
-            }
-
-            return 0;
+            auto layer = layers[layer_id];
+            size_t size = 0;
+            void *buf = session.get_buffer(layer_id, &size);
+            if (size != layer->get_cache_size()) return -1;
+            if (layer->write_cache_data(buf, size) != size)
+                return -3;
         }
 
-        int save_session(ModelSessionMemory &session) const override
-        {
-            for (int layer_id = 0; layer_id < config.num_hidden_layers; layer_id++)
-            {
-                auto layer = layers[layer_id];
-                const size_t size = layer->get_cache_size();
-                void *buf = session.prepare_buffer(layer_id, size);
-                if (layer->read_cache_data(buf, size) != size)
-                    return -1;
-            }
+        return 0;
+    }
 
-            return 0;
+    void HeterogeneousModel::load(const std::string &path, TensorLoader *loader, const std::vector<int> &layer_ids)
+    {
+        word_embeddings->load(path + "embed_tokens.", loader);
+        final_layernorm->load(path + "norm.", loader);
+        if (lm_head)
+            lm_head->load("lm_head.", loader);
+
+        for (int i = 0; i < num_hidden_layers; i++)
+        {
+            std::string layer_prefix = path + "layers." + std::to_string(layer_ids[i]) + '.';
+            layers[i]->load(layer_prefix, loader);
         }
+    }
 
-        int load_session(ModelSessionMemory &session) override
-        {
-            for (int layer_id = 0; layer_id < config.num_hidden_layers; layer_id++)
-            {
-                auto layer = layers[layer_id];
-                size_t size = 0;
-                void *buf = session.get_buffer(layer_id, &size);
-                if (size != layer->get_cache_size()) return -1;
-                if (layer->write_cache_data(buf, size) != size)
-                    return -3;
-            }
+    int64_t HeterogeneousModel::get_param_num_of_layers(bool effective_only) const
+    {
+        int64_t r = 0;
+        for (auto &layer : layers)
+            r += layer->get_param_num(effective_only);
+        return r;
+    }
 
-            return 0;
-        }
+    ggml::tensor *LMFinalSteps::forward(HeterogeneousModel *model, ComputeContext *ctx, ggml::tensor *input_ids, ggml::tensor *hidden_states)
+    {
+        hidden_states = ggml::view_2d(ctx, hidden_states, model->hidden_size, 1,
+            ggml::row_size(hidden_states),
+            (ggml::get_dim(input_ids, 0) - 1) * ggml::row_size(hidden_states));
 
-        void load(const std::string &path, TensorLoader *loader, const std::vector<int> &layer_ids) override
-        {
-            word_embeddings.load(path + "embed_tokens.", loader);
-            final_layernorm.load(path + "norm.", loader);
-            if (lm_head)
-                lm_head->load("lm_head.", loader);
+        ggml::tensor *transformer_outputs = model->final_layernorm->forward(ctx, hidden_states);
 
-            for (int i = 0; i < config.num_hidden_layers; i++)
-            {
-                std::string layer_prefix = path + "layers." + std::to_string(layer_ids[i]) + '.';
-                layers[i]->load(layer_prefix, loader);
-            }
-        }
+        transformer_outputs =
+                ggml::view_1d(ctx, transformer_outputs, model->hidden_size, 0);
 
-    private:
-        struct state
-        {
-            size_t cache_size;
-        };
-    protected:
-        virtual void before_forward(ComputeContext *ctx, ggml::tensor *input_ids, int n_past) {}
+        ggml::tensor *lm_logits = model->lm_head ? model->lm_head->forward(ctx, transformer_outputs)
+                                                 : model->word_embeddings->forward(ctx, transformer_outputs);
 
-        virtual int64_t get_param_num_of_layers(bool effective_only) const
-        {
-            int64_t r = 0;
-            for (auto &layer : layers)
-                r += layer->get_param_num(effective_only);
-            return r;
-        }
+        if (model->logits_pp)
+            lm_logits = model->logits_pp->forward(ctx, lm_logits);
+        return lm_logits;
+    }
 
-        ggml::tensor *final_steps(ComputeContext *ctx, ggml::tensor *input_ids, ggml::tensor *hidden_states)
-        {
-            hidden_states = ggml::view_2d(ctx, hidden_states, config.hidden_size, 1,
-                config.hidden_size * ggml::element_size(hidden_states),
-                (input_ids->ne[0] - 1) * config.hidden_size * ggml::element_size(hidden_states));
+    ggml::tensor *EmbeddingPoolingFinalSteps::forward(HeterogeneousModel *model, ComputeContext *ctx, ggml::tensor *input_ids, ggml::tensor *hidden_states)
+    {
+        ggml::tensor *transformer_outputs = model->final_layernorm->forward(ctx, hidden_states);
 
-            ggml::tensor *transformer_outputs = final_layernorm.forward(ctx, hidden_states);
+        return transformer_outputs;
+    }
 
-            transformer_outputs =
-                    ggml::view_1d(ctx, transformer_outputs, config.hidden_size, 0);
+    ggml::tensor *EmbeddingLastTokenFinalSteps::forward(HeterogeneousModel *model, ComputeContext *ctx, ggml::tensor *input_ids, ggml::tensor *hidden_states)
+    {
+        hidden_states = ggml::view_2d(ctx, hidden_states, model->hidden_size, 1,
+            ggml::row_size(hidden_states),
+            (ggml::get_dim(input_ids, 0) - 1) * ggml::row_size(hidden_states));
+        ggml::tensor *transformer_outputs = model->final_layernorm->forward(ctx, hidden_states);
+        transformer_outputs = ggml::simple_norm(ctx, transformer_outputs, 1e-5f);
+        return transformer_outputs;
+    }
 
-            ggml::tensor *lm_logits = lm_head ? lm_head->forward(ctx, transformer_outputs)
-                                             : word_embeddings.forward(ctx, transformer_outputs);
+    template <class Embedding> Block *create_embedding(InitContext *ctx, const BaseConfig &config)
+    {
+        return new Embedding(LayerMover(ctx, LayerAllocatorManager::MiscLayer::Prolog), config.vocab_size, config.hidden_size, config.max_length);
+    }
 
-            if (logits_pp)
-                lm_logits = logits_pp->forward(ctx, lm_logits);
-            return lm_logits;
-        }
-    public:
-        Config config;
-        Embedding word_embeddings;
-        FinalNorm final_layernorm;
-        Block *lm_head;
-        Block *logits_pp;
-    protected:
-        // std::vector<std::unique_ptr<Block>> layers;
-        std::vector<Block *> layers;
-        size_t cache_size;
-    };
+    template <class FinalNorm> Block *create_final_norm(InitContext *ctx, const BaseConfig &config)
+    {
+        return new FinalNorm(LayerMover(ctx, LayerAllocatorManager::MiscLayer::Epilog), config.hidden_size);
+    }
+
+    Block *create_lm_head(InitContext *ctx, const BaseConfig &config, bool bias = false)
+    {
+        return new Linear(LayerMover(ctx, LayerAllocatorManager::MiscLayer::Epilog), config.hidden_size, config.vocab_size, bias);
+    }
 
     template <class Config, class Embedding, class FinalNorm, class LayerBlock, typename... _Types> class Model :
-        public HeterogeneousModel<Config, Embedding, FinalNorm>
+        public HeterogeneousModel
     {
     private:
-        typedef HeterogeneousModel<Config, Embedding, FinalNorm> Base;
+        typedef HeterogeneousModel Base;
     protected:
         class Accessor
         {
@@ -1648,11 +1744,16 @@ namespace chatllm
     public:
         Model() = default;
         Model(InitContext *ctx, const Config &config, bool lm_head_bias, _Types... layer_args)
-            : Model(ctx, config, new Linear(ctx, config.hidden_size, config.vocab_size, lm_head_bias), std::forward<_Types>(layer_args)...)
+            : Model(ctx, config,
+                create_lm_head(ctx, config, lm_head_bias),
+                std::forward<_Types>(layer_args)...)
         {}
 
         Model(InitContext *ctx, const Config &config, Block *lm_head, _Types... layer_args)
-        : HeterogeneousModel<Config, Embedding, FinalNorm>(ctx, config, lm_head,
+        : HeterogeneousModel(ctx, config.num_hidden_layers, config.hidden_size,
+                            create_embedding<Embedding>(ctx, config),
+                            create_final_norm<FinalNorm>(ctx, config),
+                            lm_head,
                             [&](InitContext *ctx, int layer_index) {
                                 return new LayerBlock(ctx, std::forward<_Types>(layer_args)...);
                             })
@@ -1676,36 +1777,14 @@ namespace chatllm
     {
     public:
         typedef Model<Config, Embedding, FinalBlock, LayerBlock, _Types...> Base;
-        typedef HeterogeneousModel<Config, Embedding, FinalBlock> BaseBase;
+        typedef HeterogeneousModel BaseBase;
 
         EmbeddingModel() = default;
 
         EmbeddingModel(InitContext *ctx, const Config &config, _Types... layer_args)
         : Base(ctx, config, nullptr, std::forward<_Types>(layer_args)...)
         {
-        }
-
-        ggml::tensor *forward(ComputeContext *ctx, ggml::tensor *input_ids, int n_past) override
-        {
-            Base::before_forward(ctx, input_ids, n_past);
-
-            ctx->move_to_layer(LayerAllocatorManager::Prolog);
-            ggml::tensor *hidden_states = Base::word_embeddings.forward(ctx, input_ids, n_past);
-            for (auto &layer : BaseBase::layers)
-            {
-                ctx->move_to_layer(layer->get_id());
-                hidden_states = layer->forward(ctx, hidden_states, n_past);
-            }
-            ctx->move_to_layer(LayerAllocatorManager::MiscLayer::Epilog);
-            return final_steps(ctx, input_ids, hidden_states);
-        }
-
-    protected:
-        ggml::tensor *final_steps(ComputeContext *ctx, ggml::tensor *input_ids, ggml::tensor *hidden_states)
-        {
-            ggml::tensor *transformer_outputs = Base::final_layernorm.forward(ctx, hidden_states);
-
-            return transformer_outputs;
+            Base::set_final_steps(std::make_unique<EmbeddingPoolingFinalSteps>());
         }
     };
 
@@ -1888,7 +1967,7 @@ namespace chatllm
         #include "../models/numinamath.cpp"
     }
 
-    namespace smollm
+    namespace smol
     {
         #include "../models/smollm.cpp"
     }
@@ -2339,6 +2418,7 @@ namespace chatllm
         CASE(DEEPSEEK_R1_DISTILL_QWEN, qwen::ds_r1_distill, 1)  \
         CASE(DEEPSEEK_R1_DISTILL_QWEN3,qwen::ds_r1_distill_v3, 1)\
         CASE(AQUILA2,               aquila::v2, 1)              \
+        CASE(QWEN2_AUDIO,           qwen::v2_audio, 1)          \
         CASE(QWEN2_5_VL,            qwen::v2_5_vl, 1)           \
         CASE(QWEN3,                 qwen::v3, 1)                \
                                                                 \
@@ -2360,6 +2440,7 @@ namespace chatllm
         CASE(MINICPM2,              minicpm::v2, 1)             \
         CASE(MINICPM_MoE,           minicpm::moe, 1)            \
         CASE(MINICPM3,              minicpm::v3, 1)             \
+        CASE(MINICPM4,              minicpm::v4, 1)             \
                                                                 \
         CASE(PERSIMMON,             adept::persimmon, 1)        \
         CASE(FUYU,                  adept::fuyu, 1)             \
@@ -2383,7 +2464,8 @@ namespace chatllm
                                                                 \
         CASE(INDEX,                 index, 1)                   \
                                                                 \
-        CASE(SMOLLM,                smollm, 1)                  \
+        CASE(SMOLLM,                smol::lm, 1)                \
+        CASE(SMOL_VLM,              smol::vlm, 1)               \
         CASE(LLAMA3_GROQ_TOOL,      groq, 1)                    \
                                                                 \
         CASE(OLMoE,                 allenai::moe, 1)            \
@@ -2420,7 +2502,10 @@ namespace chatllm
         CASE(MiniCPM_ReRanker_Light,    minicpm::ranker_light, 1)\
         CASE(ORPHEUS_TTS,               orpheus::tts, 1)        \
         CASE(OUTE_TTS_LLAMA,            oute::tts_llama, 1)     \
-        CASE(OUTE_TTS_QWEN3,            oute::tts_qwen3, 1)
+        CASE(OUTE_TTS_QWEN3,            oute::tts_qwen3, 1)     \
+        CASE(QWEN3_Embedding,           qwen::v3_emb, 1)        \
+        CASE(QWEN3_ReRanker,            qwen::v3_ranker, 1)     \
+        \
 
 
     AbstractModel *ModelFactory::load_model_again(ModelLoader &loader, const ModelObject::extra_args &args)
